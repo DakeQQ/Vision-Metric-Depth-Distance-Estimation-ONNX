@@ -22,8 +22,8 @@ FOCAL = None                     # Set None for auto else fixed. FOCAL here is t
 OUTPUT_BEV = True                # True for output the bird eye view occupancy map.
 SOBEL_KERNEL_SIZE = 3            # [3, 5] set for gradient map.
 DEFAULT_GRAD_THRESHOLD = 0.3     # Set a appropriate value for detected object.
-BEV_WIDTH_METERS = 10.0
-BEV_DEPTH_METERS = 10.0
+BEV_WIDTH_METERS = 10.0          # The max depth in the image.
+BEV_DEPTH_METERS = 10.0          # The max width in the image.
 
 if PROJECT_PATH not in sys.path:
     sys.path.append(PROJECT_PATH)
