@@ -54,7 +54,7 @@ def normalized_view_plane_uv(width, height, aspect_ratio) -> torch.Tensor:
     # Factor out common (size - 1) / size computation
     scale_factor = lambda size: (size - 1) / size
     span_x = aspect_ratio / denom * scale_factor(width)
-    span_y = 1 / denom * scale_factor(height)
+    span_y = scale_factor(height) / denom
 
     u = torch.linspace(-span_x, span_x, width, dtype=torch.float32)
     v = torch.linspace(-span_y, span_y, height, dtype=torch.float32)
@@ -66,16 +66,17 @@ def normalized_view_plane_uv(width, height, aspect_ratio) -> torch.Tensor:
 def solve_optimal_focal_shift(uv_flat, xy, z, num_iters=15):
     shift = 0.0
     # Gauss-Newton iterations
+    z_shifted = z
     for _ in range(num_iters):
-        z_shifted = z + shift
         xy_proj = xy / z_shifted
 
         focal = (xy_proj * uv_flat).sum() / ((xy_proj ** 2).sum() + 1e-6)
         residual = focal * xy_proj - uv_flat
-        jacobian = -focal * xy / (z_shifted ** 2)
+        jacobian = -focal * xy / (z_shifted ** 2 + 1e-6)
 
         delta_shift = (jacobian * residual).sum() / ((jacobian ** 2).sum() + 1e-6)
         shift -= delta_shift
+        z_shifted = z + shift
     return shift
 
 
