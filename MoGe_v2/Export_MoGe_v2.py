@@ -6,18 +6,30 @@ import numpy as np
 import onnxruntime
 import matplotlib.pyplot as plt
 
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
 
-project_path = '/home/DakeQQ/Downloads/MoGe-main'                     # The project folder path. https://github.com/microsoft/MoGe
-model_path = '/home/DakeQQ/Downloads/moge-2-vits-normal/model.pt'     # The target depth model. Only support the v2 series.
-onnx_model_A = '/home/DakeQQ/Downloads/MoGe_ONNX/MoGe_v2.onnx'        # The exported onnx model path.
-test_image_path = './test.jpg'                                        # The test input after the export process.
+PROJECT_PATH = '/home/iamj/Downloads/MoGe-main'
+MODEL_PATH = '/home/iamj/Downloads/moge-2-vits-normal/model.pt'
+ONNX_MODEL_PATH = '/home/iamj/Downloads/MoGe_ONNX/MoGe.onnx'
+TEST_IMAGE_PATH = './test.jpg'
 
+INPUT_IMAGE_SIZE = [720, 1280]   # Input image shape [Height, Width]. Should be a multiple of GPU group (e.g., 16) for optimal efficiency.
+NUM_TOKENS = 3600                # Larger is finer but slower.
+FOCAL = None                     # Set None for auto else fixed. FOCAL here is the focal length relative to half the image diagonal.
 
-INPUT_IMAGE_SIZE = [720, 1280]          # Input image shape [Height, Width]. Should be a multiple of GPU group (e.g., 16) for optimal efficiency.
-NUM_TOKENS = 3600                       # Larger is finer but slower.
-FOCAL = None                            # Set None for auto else fixed. FOCAL here is the focal length relative to half the image diagonal.
-EDGE_DETECTION = False                  # True for convert the depth map into edge map.
-SOBEL_KERNEL_SIZE = 3                   # Sobel kernel size: 3, 5, or 7. Larger kernels are less sensitive to noise but may miss fine details.
+OUTPUT_BEV = True                # True for output the bird eye view occupancy map.
+SOBEL_KERNEL_SIZE = 3            # [3, 5] set for gradient map. Smaller is finer.
+DEFAULT_GRAD_THRESHOLD = 0.3     # Set a appropriate value for detected object.
+BEV_WIDTH_METERS = 10.0
+BEV_DEPTH_METERS = 10.0
+
+if PROJECT_PATH not in sys.path:
+    sys.path.append(PROJECT_PATH)
+
+from moge.model.v2 import MoGeModel
+
 
 """
 fov_x: The horizontal camera FoV in degrees. Smartphone ultra-wide: ~110-120°
@@ -41,32 +53,30 @@ FOCAL = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(
 """
 
 
-if project_path not in sys.path:
-    sys.path.append(project_path)
+# ==============================================================================
+# UTILITY FUNCTIONS
+# ==============================================================================
 
-from moge.model.v2 import MoGeModel
 
-
-def normalized_view_plane_uv(width, height, aspect_ratio) -> torch.Tensor:
-    # Simplify normalization computation
+def create_normalized_uv_grid(width, height, aspect_ratio):
+    """Create normalized UV coordinate grid for the view plane."""
     denom = (1 + aspect_ratio ** 2) ** 0.5
-
-    # Factor out common (size - 1) / size computation
     scale_factor = lambda size: (size - 1) / size
+    
     span_x = aspect_ratio / denom * scale_factor(width)
     span_y = scale_factor(height) / denom
 
     u = torch.linspace(-span_x, span_x, width, dtype=torch.float32)
     v = torch.linspace(-span_y, span_y, height, dtype=torch.float32)
-
+    
     u_grid, v_grid = torch.meshgrid(u, v, indexing='xy')
-    return torch.stack([u_grid, v_grid], dim=-1)  # (H, W, 2)
+    return torch.stack([u_grid, v_grid], dim=-1)
 
 
 def solve_optimal_focal_shift(uv_flat, xy, z, num_iters=15):
-    shift = 0.0
-    # Gauss-Newton iterations
+    shift = torch.zeros(1, dtype=torch.float32)
     z_shifted = z
+    # Gauss-Newton iterations
     for _ in range(num_iters):
         xy_proj = xy / z_shifted
 
@@ -81,151 +91,153 @@ def solve_optimal_focal_shift(uv_flat, xy, z, num_iters=15):
 
 
 def solve_optimal_shift(uv_flat, xy, z, focal, num_iters=15):
-    shift = 0.0
+    shift = torch.zeros(1, dtype=torch.float32)
     focal_xy = focal * xy
+    z_shifted = z
     # Gauss-Newton iterations
     for _ in range(num_iters):
-        z_shifted = z + shift
         focal_xy_z_shifted = focal_xy / z_shifted
         residual = focal_xy_z_shifted - uv_flat
         jacobian = focal_xy_z_shifted / z_shifted
 
         delta_shift = (-jacobian * residual).sum() / ((jacobian ** 2).sum() + 1e-6)
         shift -= delta_shift
+        z_shifted = z + shift
     return shift
 
 
 def get_sobel_kernels(kernel_size):
-    """
-    Generate Sobel kernels of specified size (3, 5, or 7).
-    Returns (sobel_x, sobel_y) as PyTorch tensors.
-    """
-    if kernel_size == 3:
-        # Standard 3x3 Sobel kernels
-        sobel_x = torch.tensor([
-            [-1, 0, 1],
-            [-2, 0, 2],
-            [-1, 0, 1]
-        ], dtype=torch.float32).view(1, 1, 3, 3)
-        
-        sobel_y = torch.tensor([
-            [-1, -2, -1],
-            [ 0,  0,  0],
-            [ 1,  2,  1]
-        ], dtype=torch.float32).view(1, 1, 3, 3)
-        
-    elif kernel_size == 5:
-        # 5x5 Sobel kernels (smoother, less noise-sensitive)
-        sobel_x = torch.tensor([
-            [-1, -2,  0,  2,  1],
-            [-2, -3,  0,  3,  2],
-            [-3, -5,  0,  5,  3],
-            [-2, -3,  0,  3,  2],
-            [-1, -2,  0,  2,  1]
-        ], dtype=torch.float32).view(1, 1, 5, 5)
-        
-        sobel_y = torch.tensor([
-            [-1, -2, -3, -2, -1],
-            [-2, -3, -5, -3, -2],
-            [ 0,  0,  0,  0,  0],
-            [ 2,  3,  5,  3,  2],
-            [ 1,  2,  3,  2,  1]
-        ], dtype=torch.float32).view(1, 1, 5, 5)
-        
-    elif kernel_size == 7:
-        # 7x7 Sobel kernels (even smoother, good for noisy images)
-        sobel_x = torch.tensor([
-            [-1, -2, -3,  0,  3,  2,  1],
-            [-2, -3, -5,  0,  5,  3,  2],
-            [-3, -5, -7,  0,  7,  5,  3],
-            [-4, -6, -8,  0,  8,  6,  4],
-            [-3, -5, -7,  0,  7,  5,  3],
-            [-2, -3, -5,  0,  5,  3,  2],
-            [-1, -2, -3,  0,  3,  2,  1]
-        ], dtype=torch.float32).view(1, 1, 7, 7)
-        
-        sobel_y = torch.tensor([
-            [-1, -2, -3, -4, -3, -2, -1],
-            [-2, -3, -5, -6, -5, -3, -2],
-            [-3, -5, -7, -8, -7, -5, -3],
-            [ 0,  0,  0,  0,  0,  0,  0],
-            [ 3,  5,  7,  8,  7,  5,  3],
-            [ 2,  3,  5,  6,  5,  3,  2],
-            [ 1,  2,  3,  4,  3,  2,  1]
-        ], dtype=torch.float32).view(1, 1, 7, 7)
-    else:
-        raise ValueError(f"Unsupported kernel size: {kernel_size}. Choose 3, 5, or 7.")
+    """Return Sobel kernels for gradient computation."""
+    kernels = {
+        3: (
+            torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32),
+            torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        ),
+        5: (
+            torch.tensor([[-1, -2, 0, 2, 1], [-2, -3, 0, 3, 2], [-3, -5, 0, 5, 3], 
+                         [-2, -3, 0, 3, 2], [-1, -2, 0, 2, 1]], dtype=torch.float32),
+            torch.tensor([[-1, -2, -3, -2, -1], [-2, -3, -5, -3, -2], [0, 0, 0, 0, 0], 
+                         [2, 3, 5, 3, 2], [1, 2, 3, 2, 1]], dtype=torch.float32)
+        )
+    }
     
-    return sobel_x, sobel_y
+    if kernel_size not in kernels:
+        raise ValueError(f"Unsupported kernel size: {kernel_size}. Use 3 or 5.")
+    
+    sobel_x, sobel_y = kernels[kernel_size]
+    return sobel_x.view(1, 1, kernel_size, kernel_size), sobel_y.view(1, 1, kernel_size, kernel_size)
 
+
+# ==============================================================================
+# MODEL WRAPPER
+# ==============================================================================
 
 class MoGeV2(torch.nn.Module):
-    def __init__(self, model, input_image_size, num_tokens, sobel_kernel_size=3):
-        super(MoGeV2, self).__init__()
+    def __init__(self, model, output_image_size, num_tokens, sobel_kernel_size=3):
+        super().__init__()
         self.model = model
-        self.input_image_size = input_image_size
-        self.aspect_ratio = input_image_size[1] / input_image_size[0]
-        self.sobel_kernel_size = sobel_kernel_size
-
-        # Compute base dimensions
+        self.output_image_size = output_image_size
+        self.aspect_ratio = output_image_size[1] / output_image_size[0]
+        
+        # Calculate internal processing resolution
         sqrt_tokens_aspect = num_tokens ** 0.5
         self.base_h = int(sqrt_tokens_aspect / self.aspect_ratio ** 0.5)
         self.base_w = int(sqrt_tokens_aspect * self.aspect_ratio ** 0.5)
         self.base_hw = (self.base_h, self.base_w)
-
-        # Precompute image processing constants
-        patch_size = self.model.encoder.backbone.patch_embed.patch_size
-        self.image_resize = [self.base_h * patch_size[0], self.base_w * patch_size[1]]
-        self.inv_image_std_255 = 1.0 / (255.0 * self.model.encoder.image_std)
-        self.image_mean_inv_std = self.model.encoder.image_mean / self.model.encoder.image_std
-
-        # Precompute positional embeddings
+        
+        patch_size = model.encoder.backbone.patch_embed.patch_size
+        self.internal_size = [self.base_h * patch_size[0], self.base_w * patch_size[1]]
+        
+        # Normalization constants
+        self.inv_image_std_255 = 1.0 / (255.0 * model.encoder.image_std)
+        self.image_mean_inv_std = model.encoder.image_mean / model.encoder.image_std
+        
+        # Setup positional embeddings
+        self._setup_pos_embeddings()
+        
+        # Precompute UV grids
+        self._setup_uv_grids()
+        
+        # Setup Sobel kernels
+        self.sobel_x, self.sobel_y = get_sobel_kernels(sobel_kernel_size)
+        self.sobel_padding = sobel_kernel_size // 2
+        
+        # Setup BEV parameters
+        self._setup_bev_parameters()
+    
+    def _setup_pos_embeddings(self):
+        """Prepare positional embeddings for the model."""
         pos_embed = self.model.encoder.backbone.pos_embed
-        class_pos_embed = pos_embed[:, 0:1, :]
+        class_pos_embed = pos_embed[:, :1, :]
         patch_pos_embed = pos_embed[:, 1:, :]
-
+        
         M = int((pos_embed.shape[1] - 1) ** 0.5)
         interpolate_offset = self.model.encoder.backbone.interpolate_offset
         scale_factor = (
             (self.base_h + interpolate_offset) / M,
             (self.base_w + interpolate_offset) / M
         )
-
+        
         patch_pos_embed = torch.nn.functional.interpolate(
             patch_pos_embed.reshape(1, M, M, -1).permute(0, 3, 1, 2),
-            mode="bicubic",
-            antialias=False,
-            align_corners=False,
-            scale_factor=scale_factor
+            mode="bicubic", antialias=False, align_corners=False, scale_factor=scale_factor
         ).permute(0, 2, 3, 1).flatten(1, 2)
-
+        
         self.pos_embed = torch.cat([class_pos_embed, patch_pos_embed], dim=1)
         self.model.encoder.backbone.num_register_tokens += 1
-
-        # Precompute UV grids
-        self.save_uv = []
+    
+    def _setup_uv_grids(self):
+        """Precompute UV grids for different resolution levels."""
+        self.uv_grids = []
+        
+        # Multi-scale UV grids
         for level in range(5):
             scale = 2 ** level
-            uv = normalized_view_plane_uv(
-                self.base_w * scale,
-                self.base_h * scale,
+            uv = create_normalized_uv_grid(
+                self.base_w * scale, 
+                self.base_h * scale, 
                 self.aspect_ratio
             )
-            self.save_uv.append(uv.permute(2, 0, 1).unsqueeze(0))
-
-        # Low-resolution UV for optimization
-        uv = normalized_view_plane_uv(self.base_w, self.base_h, self.aspect_ratio)
+            self.uv_grids.append(uv.permute(2, 0, 1).unsqueeze(0))
+        
+        # Low-res UV for focal recovery
+        uv = create_normalized_uv_grid(self.base_w, self.base_h, self.aspect_ratio)
         uv_lr = torch.nn.functional.interpolate(
-            uv.permute(2, 0, 1).unsqueeze(0),
-            size=(64, 64),
-            mode='bilinear',
+            uv.permute(2, 0, 1).unsqueeze(0), 
+            size=(64, 64), 
+            mode='bilinear', 
             align_corners=False
         )
-        self.save_uv.append(uv_lr.permute(0, 2, 3, 1).reshape(-1, 2))
+        self.uv_grids.append(uv_lr.permute(0, 2, 3, 1).reshape(-1, 2))
+        
+        # Projection UV grid (u-coordinate only)
+        projection_uv = create_normalized_uv_grid(
+            self.output_image_size[1], 
+            self.output_image_size[0], 
+            self.aspect_ratio
+        )
+        self.projection_uv = projection_uv.permute(2, 0, 1)[0].unsqueeze(0)
+    
+    def _setup_bev_parameters(self):
+        """Setup BEV map parameters and ROI bounds."""
+        bev_h, bev_w = self.output_image_size
+        
+        self.register_buffer('bev_w', torch.tensor(bev_w, dtype=torch.int64))
+        self.register_buffer('bev_h', torch.tensor(bev_h, dtype=torch.int64))
+        self.register_buffer('bev_scale_x', torch.tensor(bev_w / BEV_WIDTH_METERS, dtype=torch.float32))
+        self.register_buffer('bev_offset_x', torch.tensor(bev_w / 2.0, dtype=torch.float32))
+        self.register_buffer('bev_scale_z', torch.tensor(bev_h / BEV_DEPTH_METERS, dtype=torch.float32))
+        
+        self.bev_map = torch.zeros((bev_h, bev_w), dtype=torch.float32)
+        
+        # Define ROI (skip top half and borders)
+        self.h_start = bev_h // 2
+        self.h_end = bev_h - self.sobel_padding
+        self.w_start = self.sobel_padding
+        self.w_end = bev_w - self.sobel_padding
+        
+        self.uv_roi = self.projection_uv[:, self.h_start:self.h_end, self.w_start:self.w_end]
 
-        # Initialize Sobel kernels with specified size
-        self.sobel_x, self.sobel_y = get_sobel_kernels(sobel_kernel_size)
-        self.sobel_padding = sobel_kernel_size // 2
 
     def recover_focal_shift(self, points, focal=None, downsample_size=(64, 64)):
         points_lr = torch.nn.functional.interpolate(
@@ -238,222 +250,236 @@ class MoGeV2(torch.nn.Module):
         xy, z = torch.split(points_lr, [2, 1], dim=-1)
 
         if focal:
-            return solve_optimal_shift(self.save_uv[-1], xy, z, focal)
+            return solve_optimal_shift(self.uv_grids[-1], xy, z, focal)
         else:
-            return solve_optimal_focal_shift(self.save_uv[-1], xy, z)
-
-    def forward(self, image, focal=None):
-        # Preprocess image
+            return solve_optimal_focal_shift(self.uv_grids[-1], xy, z)
+    
+    def forward(self, image, focal=None, threshold=torch.tensor(1.0)):
+        # Resize input to internal resolution
         image = image.float()
-        if self.image_resize != INPUT_IMAGE_SIZE:
+        if self.internal_size != self.output_image_size:
             image = torch.nn.functional.interpolate(
-                image,
-                self.image_resize,
-                mode="bilinear",
-                align_corners=False,
-                antialias=False
+                image, self.internal_size, mode="bilinear", 
+                align_corners=False, antialias=False
             )
+        
+        # Normalize image
         x = image * self.inv_image_std_255 - self.image_mean_inv_std
-
+        
         # Patch embedding
         x = self.model.encoder.backbone.patch_embed.proj(x)
         x = self.model.encoder.backbone.patch_embed.norm(x.flatten(2).transpose(1, 2))
         x = torch.cat([self.model.encoder.backbone.cls_token, x], dim=1) + self.pos_embed.data
-
-        # Process through blocks and collect intermediate outputs
+        
+        # Encoder forward pass
         outputs = []
         for i, blk in enumerate(self.model.encoder.backbone.blocks):
             x = blk(x)
             if i in self.model.encoder.intermediate_layers:
                 outputs.append(x)
-
-        # Normalize and separate class tokens
+        
         outputs = [self.model.encoder.backbone.norm(out) for out in outputs]
         num_reg_tokens = self.model.encoder.backbone.num_register_tokens
         features = [(out[:, num_reg_tokens:], out[:, 0]) for out in outputs]
-
-        # Project and combine features
+        
+        # Feature projection
         x = sum(
             proj(feat.permute(0, 2, 1).unflatten(2, self.base_hw).contiguous())
             for proj, (feat, _) in zip(self.model.encoder.output_projections, features)
         )
-
-        # Concatenate UV grids with features
-        features_with_uv = [
-            torch.cat([x, self.save_uv[0]], dim=1),
-            self.save_uv[1],
-            self.save_uv[2],
-            self.save_uv[3],
-            self.save_uv[4]
-        ]
-
-        # Decode to points
+        
+        # Multi-scale features with UV
+        features_with_uv = [torch.cat([x, self.uv_grids[0]], dim=1)] + self.uv_grids[1:5]
         features_with_uv = self.model.neck(features_with_uv)
         points = self.model.points_head(features_with_uv)[-1].permute(0, 2, 3, 1)
         points = self.model._remap_points(points)
-
-        # Compute metric depth
+        
+        # Recover metric scale and shift
         cls_token = features[-1][1]
         metric_scale = self.model.scale_head(cls_token).exp()
         shift = self.recover_focal_shift(points, focal=focal)
-
+        
+        # Compute depth
         depth = (points[..., 2] + shift) * metric_scale
-        depth = torch.nn.functional.interpolate(
-            depth.unsqueeze(0),
-            self.input_image_size,
-            mode='bilinear',
-            align_corners=False,
-            antialias=False
-        )
 
-        if EDGE_DETECTION:
-            # Apply Sobel filters with the specified kernel size
+        if OUTPUT_BEV:
+            # Compute gradient map
             dx = torch.nn.functional.conv2d(depth, self.sobel_x, padding=self.sobel_padding)
             dy = torch.nn.functional.conv2d(depth, self.sobel_y, padding=self.sobel_padding)
-            gradient_map = torch.pow(dx ** 2 + dy ** 2, 0.4)  # Use 0.4 for amplify the small gradient values.
-            min_val, max_val = torch.aminmax(gradient_map)    
-            gradient_map = (gradient_map - min_val) / (max_val - min_val)  # Normalize to 0 ~ 1
-            return gradient_map
+            gradient_map = torch.sqrt(dx ** 2 + dy ** 2)
+
+            # Generate BEV map from ROI
+            grad_roi = gradient_map[..., self.h_start:self.h_end, self.w_start:self.w_end]
+            depth_roi = depth[..., self.h_start:self.h_end, self.w_start:self.w_end]
+
+            mask = grad_roi > threshold
+            valid_z = depth_roi[mask]
+            valid_u = self.uv_roi[mask]
+
+            # Project to BEV grid
+            x_idx = (valid_u * valid_z * self.bev_scale_x + self.bev_offset_x).long()
+            z_idx = (valid_z * self.bev_scale_z).long()
+
+            self.bev_map[z_idx, x_idx] = 1.0
+            bev = torch.flip(self.bev_map, dims=[0])
+        
+            return depth, bev
 
         return depth
 
 
-model = MoGeModel.from_pretrained(model_path).to('cpu').eval().float()
-model = MoGeV2(model, INPUT_IMAGE_SIZE, NUM_TOKENS, sobel_kernel_size=SOBEL_KERNEL_SIZE)
-image = torch.ones([1, 3, INPUT_IMAGE_SIZE[0], INPUT_IMAGE_SIZE[1]], dtype=torch.uint8)
+# ==============================================================================
+# EXPORT TO ONNX
+# ==============================================================================
 
-print(f'\nUsing Sobel kernel size: {SOBEL_KERNEL_SIZE}x{SOBEL_KERNEL_SIZE}')
-print('\nExport Start.')
-with torch.inference_mode():
-    if FOCAL:
-        focal = torch.tensor([FOCAL], dtype=torch.float32)
-        in_feed = (image, focal)
-        input_names = ['image', 'focal']
-    else:
-        in_feed = (image,)
-        input_names = ['image']
+def export_model_to_onnx():
+    """Load model, export to ONNX format."""
+    model = MoGeModel.from_pretrained(MODEL_PATH).to('cpu').eval().float()
+    model = MoGeV2(model, INPUT_IMAGE_SIZE, NUM_TOKENS, sobel_kernel_size=SOBEL_KERNEL_SIZE)
+    
+    image = torch.ones([1, 3, INPUT_IMAGE_SIZE[0], INPUT_IMAGE_SIZE[1]], dtype=torch.uint8)
+    threshold_tensor = torch.tensor(DEFAULT_GRAD_THRESHOLD, dtype=torch.float32)
+    
+    print(f'\nModel Configuration:')
+    print(f'  Sobel kernel: {SOBEL_KERNEL_SIZE}x{SOBEL_KERNEL_SIZE}')
+    print(f'  Internal resolution: {model.internal_size}')
+    print(f'  Output resolution: {INPUT_IMAGE_SIZE}')
+    print(f'  BEV range: {BEV_WIDTH_METERS}m (width) × {BEV_DEPTH_METERS}m (depth)')
+    print('\nExporting to ONNX...')
+    
+    with torch.inference_mode():
+        if FOCAL:
+            focal = torch.tensor([FOCAL], dtype=torch.float32)
+            inputs = (image, focal, threshold_tensor)
+            input_names = ['image', 'focal', 'threshold']
+        else:
+            inputs = (image, None, threshold_tensor)
+            input_names = ['image', 'threshold']
 
-    torch.onnx.export(
-            model,
-            in_feed,
-            onnx_model_A,
+        if OUTPUT_BEV:
+            output_names = ['depth_map', 'bev_map']
+        else:
+            output_names = ['depth_map']
+        
+        torch.onnx.export(
+            model, inputs, ONNX_MODEL_PATH,
             input_names=input_names,
-            output_names=['gradient_map'] if EDGE_DETECTION else ['depth_in_meters'],
+            output_names=output_names,
             do_constant_folding=True,
             opset_version=17,
             dynamo=False
         )
-    del model
-    del in_feed
-    del input_names
-    del image
-
-    if project_path in sys.path:
-        sys.path.remove(project_path)
-
-    print('\nExport Done.')
+    
+    print('✅ Export complete.\n')
+    
+    # Cleanup
+    del model, inputs, image
+    if PROJECT_PATH in sys.path:
+        sys.path.remove(PROJECT_PATH)
 
 
-# ONNX Runtime settings
-session_opts = onnxruntime.SessionOptions()
-session_opts.log_severity_level = 4              # Error level, it an adjustable value.
-session_opts.inter_op_num_threads = 0            # Run different nodes with num_threads. Set 0 for auto.
-session_opts.intra_op_num_threads = 0            # Under the node, execute the operators with num_threads. Set 0 for auto.
-session_opts.enable_cpu_mem_arena = True         # True for execute speed; False for less memory usage.
-session_opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-session_opts.add_session_config_entry("session.set_denormal_as_zero", "1")
-session_opts.add_session_config_entry("session.intra_op.allow_spinning", "1")
-session_opts.add_session_config_entry("session.inter_op.allow_spinning", "1")
-session_opts.add_session_config_entry("session.enable_quant_qdq_cleanup", "1")
-session_opts.add_session_config_entry("session.qdq_matmulnbits_accuracy_level", "4")
-session_opts.add_session_config_entry("optimization.enable_gelu_approximation", "1")
-session_opts.add_session_config_entry("disable_synchronize_execution_providers", "1")
-session_opts.add_session_config_entry("optimization.minimal_build_optimizations", "")
-session_opts.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
+# ==============================================================================
+# ONNX INFERENCE
+# ==============================================================================
+
+def run_onnx_inference():
+    """Run inference using exported ONNX model."""
+    session_opts = onnxruntime.SessionOptions()
+    session_opts.log_severity_level = 4
+    session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    
+    ort_session = onnxruntime.InferenceSession(
+        ONNX_MODEL_PATH, 
+        sess_options=session_opts, 
+        providers=['CPUExecutionProvider']
+    )
+    
+    print(f"ONNX Runtime Providers: {ort_session.get_providers()}")
+    
+    # Prepare input
+    raw_img = cv2.imread(TEST_IMAGE_PATH)
+    if raw_img is None:
+        print(f"❌ Error: Could not read image at {TEST_IMAGE_PATH}")
+        sys.exit(1)
+    
+    rgb_img = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
+    resized_img = cv2.resize(rgb_img, (INPUT_IMAGE_SIZE[1], INPUT_IMAGE_SIZE[0]))
+    image_tensor = np.expand_dims(resized_img, axis=0).transpose(0, 3, 1, 2)
+    
+    # Build input dictionary
+    input_names = [inp.name for inp in ort_session.get_inputs()]
+    output_names = [out.name for out in ort_session.get_outputs()]
+    
+    input_feed = {input_names[0]: image_tensor}
+    if 'threshold' in input_names:
+        input_feed['threshold'] = np.array(DEFAULT_GRAD_THRESHOLD, dtype=np.float32)
+    if 'focal' in input_names and FOCAL:
+        input_feed['focal'] = np.array([FOCAL], dtype=np.float32)
+    
+    # Run inference
+    print(f"\nRunning inference on {TEST_IMAGE_PATH}...")
+    start = time.time()
+    results = ort_session.run(output_names, input_feed)
+    elapsed = time.time() - start
+    print(f'⏱️  Inference time: {elapsed:.3f} seconds')
+    
+    return resized_img, results[0][0], results[1] if len(output_names) > 1 else None
 
 
-ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_opts, providers=['CPUExecutionProvider'], provider_options=None)
-print(f"\nUsable Providers: {ort_session_A.get_providers()}")
-in_name_A = ort_session_A.get_inputs()
-out_name_A = ort_session_A.get_outputs()
-in_name_A = [i.name for i in in_name_A]
-out_name_A = [out_name_A[0].name]
+# ==============================================================================
+# VISUALIZATION
+# ==============================================================================
+
+def visualize_results(input_image, depth_map, bev_map):
+    """Display input, depth, and BEV maps."""
+    print("\n📊 Generating visualization...")
+    
+    plt.figure(figsize=(18, 6))
+    half_h = INPUT_IMAGE_SIZE[0] // 2
+    
+    # Input Image
+    plt.subplot(1, 3, 1)
+    plt.imshow(input_image)
+    plt.axhline(y=half_h, color='r', linestyle='--', linewidth=2)
+    plt.text(10, half_h - 10, 'IGNORED REGION', color='red', fontweight='bold', fontsize=10)
+    plt.title(f'Input Image ({INPUT_IMAGE_SIZE[0]}×{INPUT_IMAGE_SIZE[1]})')
+    plt.axis('off')
+    
+    # Depth Map
+    plt.subplot(1, 3, 2)
+    plt.imshow(depth_map, cmap='turbo')
+    plt.axhline(y=half_h, color='w', linestyle='--', linewidth=2)
+    plt.title('Depth Map (Metric)')
+    plt.colorbar(label='Depth (m)', fraction=0.046, pad=0.04)
+    plt.axis('off')
+
+    if bev_map is not None:
+        # BEV Occupancy
+        plt.subplot(1, 3, 3)
+        extent = [-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS]
+        plt.imshow(bev_map, cmap='Greys', interpolation='bilinear', extent=extent)
+        plt.plot(0, 0, 'ro', markersize=8, label='Camera Position')
+        plt.title(f'BEV Occupancy Map ({INPUT_IMAGE_SIZE[0]}×{INPUT_IMAGE_SIZE[1]})')
+        plt.xlabel('Lateral Distance (m)')
+        plt.ylabel('Longitudinal Distance (m)')
+        plt.legend()
+        plt.grid(True, color='green', linestyle='--', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    print("✅ Visualization complete.")
 
 
-# Load the raw image using OpenCV
-raw_img = cv2.imread(test_image_path)
-if raw_img is None:
-    print(f"Error: Could not read image at {test_image_path}")
-    sys.exit()
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
 
-# The model expects RGB, but OpenCV loads images in BGR format, so we convert.
-rgb_img = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
-
-# Resize the image to the exact size the model expects.
-# cv2.resize expects (width, height).
-resized_img = cv2.resize(rgb_img, (ort_session_A._inputs_meta[0].shape[-1], ort_session_A._inputs_meta[0].shape[-2]))
-
-# The model's ONNX graph expects a uint8 tensor with the shape (N, C, H, W).
-# 1. Add a batch dimension: (H, W, C) -> (1, H, W, C)
-# 2. Change layout to (1, C, H, W)
-image_tensor = np.expand_dims(resized_img, axis=0).transpose(0, 3, 1, 2)
-
-print(f"\nInput tensor prepared with shape: {image_tensor.shape} and dtype: {image_tensor.dtype}")
-
-# --- Run Inference ---
-input_feed_A = {
-    in_name_A[0]: onnxruntime.OrtValue.ortvalue_from_numpy(image_tensor, 'cpu', 0)
-}
-
-if len(in_name_A) > 1:
-    model_A_dtype = ort_session_A._inputs_meta[1].type
-    if 'float16' in model_A_dtype:
-        model_A_dtype = np.float16
-    else:
-        model_A_dtype = np.float32
-    input_feed_A[in_name_A[1]] = onnxruntime.OrtValue.ortvalue_from_numpy(np.array([FOCAL], dtype=model_A_dtype), 'cpu', 0)
-
-print(f"\nRunning inference on ONNX model...")
-start = time.time()
-onnx_result = ort_session_A.run_with_ort_values(out_name_A, input_feed_A)
-print(f'\nTime cost: {time.time() - start:.3f} seconds')
-
-# The output is a list containing one array. We extract the array.
-depth_map_onnx = onnx_result[0].numpy()
-
-# The output depth map has a shape of (1, H, W), so we remove the batch dimension.
-depth_map_onnx = np.squeeze(depth_map_onnx)
-print(f"\n✅ ONNX inference complete! Output depth map shape: {depth_map_onnx.shape}")
-
-
-# =================================================================================
-# 3. VISUALIZE THE RESULT (Method 2: Matplotlib)
-# =================================================================================
-
-print("\nVisualizing results using Matplotlib...")
-
-plt.figure(figsize=(14, 7))
-
-# --- Display Original Image ---
-plt.subplot(1, 2, 1)
-# Use the RGB image we converted earlier for correct color display in Matplotlib
-plt.imshow(rgb_img)
-plt.title('Original Image')
-plt.axis('off')
-
-# --- Display Depth Heatmap from ONNX Inference ---
-plt.subplot(1, 2, 2)
-# imshow can directly handle the floating-point depth array.
-plt.imshow(depth_map_onnx, cmap='turbo')
-title_suffix = f' ({SOBEL_KERNEL_SIZE}x{SOBEL_KERNEL_SIZE} Sobel)' if EDGE_DETECTION else ''
-plt.title(f'{"Edge Heatmap" if EDGE_DETECTION else "Depth Heatmap"} (from ONNX model){title_suffix}')
-# Add a color bar to show the mapping of colors to depth values.
-plt.colorbar(label='Normalized Gradient' if EDGE_DETECTION else 'Depth Metric')
-plt.axis('off')
-
-# Adjust layout and display the plot
-plt.tight_layout()
-plt.show()
-
-print("\n✅ Visualization complete.")
+if __name__ == "__main__":
+    # Export model
+    export_model_to_onnx()
+    
+    # Run inference
+    input_img, depth, bev = run_onnx_inference()
+    
+    # Visualize results
+    visualize_results(input_img, depth, bev)
