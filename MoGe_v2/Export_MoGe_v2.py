@@ -17,6 +17,7 @@ INPUT_IMAGE_SIZE = [720, 1280]          # Input image shape [Height, Width]. Sho
 NUM_TOKENS = 3600                       # Larger is finer but slower.
 FOCAL = None                            # Set None for auto else fixed. FOCAL here is the focal length relative to half the image diagonal.
 EDGE_DETECTION = False                  # True for convert the depth map into edge map.
+SOBEL_KERNEL_SIZE = 3                   # Sobel kernel size: 3, 5, or 7. Larger kernels are less sensitive to noise but may miss fine details.
 
 """
 fov_x: The horizontal camera FoV in degrees. Smartphone ultra-wide: ~110-120°
@@ -93,12 +94,77 @@ def solve_optimal_shift(uv_flat, xy, z, focal, num_iters=15):
     return shift
 
 
+def get_sobel_kernels(kernel_size):
+    """
+    Generate Sobel kernels of specified size (3, 5, or 7).
+    Returns (sobel_x, sobel_y) as PyTorch tensors.
+    """
+    if kernel_size == 3:
+        # Standard 3x3 Sobel kernels
+        sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        sobel_y = torch.tensor([
+            [-1, -2, -1],
+            [ 0,  0,  0],
+            [ 1,  2,  1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+        
+    elif kernel_size == 5:
+        # 5x5 Sobel kernels (smoother, less noise-sensitive)
+        sobel_x = torch.tensor([
+            [-1, -2,  0,  2,  1],
+            [-2, -3,  0,  3,  2],
+            [-3, -5,  0,  5,  3],
+            [-2, -3,  0,  3,  2],
+            [-1, -2,  0,  2,  1]
+        ], dtype=torch.float32).view(1, 1, 5, 5)
+        
+        sobel_y = torch.tensor([
+            [-1, -2, -3, -2, -1],
+            [-2, -3, -5, -3, -2],
+            [ 0,  0,  0,  0,  0],
+            [ 2,  3,  5,  3,  2],
+            [ 1,  2,  3,  2,  1]
+        ], dtype=torch.float32).view(1, 1, 5, 5)
+        
+    elif kernel_size == 7:
+        # 7x7 Sobel kernels (even smoother, good for noisy images)
+        sobel_x = torch.tensor([
+            [-1, -2, -3,  0,  3,  2,  1],
+            [-2, -3, -5,  0,  5,  3,  2],
+            [-3, -5, -7,  0,  7,  5,  3],
+            [-4, -6, -8,  0,  8,  6,  4],
+            [-3, -5, -7,  0,  7,  5,  3],
+            [-2, -3, -5,  0,  5,  3,  2],
+            [-1, -2, -3,  0,  3,  2,  1]
+        ], dtype=torch.float32).view(1, 1, 7, 7)
+        
+        sobel_y = torch.tensor([
+            [-1, -2, -3, -4, -3, -2, -1],
+            [-2, -3, -5, -6, -5, -3, -2],
+            [-3, -5, -7, -8, -7, -5, -3],
+            [ 0,  0,  0,  0,  0,  0,  0],
+            [ 3,  5,  7,  8,  7,  5,  3],
+            [ 2,  3,  5,  6,  5,  3,  2],
+            [ 1,  2,  3,  4,  3,  2,  1]
+        ], dtype=torch.float32).view(1, 1, 7, 7)
+    else:
+        raise ValueError(f"Unsupported kernel size: {kernel_size}. Choose 3, 5, or 7.")
+    
+    return sobel_x, sobel_y
+
+
 class MoGeV2(torch.nn.Module):
-    def __init__(self, model, input_image_size, num_tokens):
+    def __init__(self, model, input_image_size, num_tokens, sobel_kernel_size=3):
         super(MoGeV2, self).__init__()
         self.model = model
         self.input_image_size = input_image_size
         self.aspect_ratio = input_image_size[1] / input_image_size[0]
+        self.sobel_kernel_size = sobel_kernel_size
 
         # Compute base dimensions
         sqrt_tokens_aspect = num_tokens ** 0.5
@@ -128,6 +194,7 @@ class MoGeV2(torch.nn.Module):
             patch_pos_embed.reshape(1, M, M, -1).permute(0, 3, 1, 2),
             mode="bicubic",
             antialias=False,
+            align_corners=False,
             scale_factor=scale_factor
         ).permute(0, 2, 3, 1).flatten(1, 2)
 
@@ -150,18 +217,21 @@ class MoGeV2(torch.nn.Module):
         uv_lr = torch.nn.functional.interpolate(
             uv.permute(2, 0, 1).unsqueeze(0),
             size=(64, 64),
-            mode='bilinear'
+            mode='bilinear',
+            align_corners=False
         )
         self.save_uv.append(uv_lr.permute(0, 2, 3, 1).reshape(-1, 2))
 
-        self.sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        self.sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        # Initialize Sobel kernels with specified size
+        self.sobel_x, self.sobel_y = get_sobel_kernels(sobel_kernel_size)
+        self.sobel_padding = sobel_kernel_size // 2
 
     def recover_focal_shift(self, points, focal=None, downsample_size=(64, 64)):
         points_lr = torch.nn.functional.interpolate(
             points.permute(0, 3, 1, 2),
             size=downsample_size,
-            mode='bilinear'
+            mode='bilinear',
+            align_corners=False
         ).permute(0, 2, 3, 1).reshape(-1, 3)
 
         xy, z = torch.split(points_lr, [2, 1], dim=-1)
@@ -173,13 +243,15 @@ class MoGeV2(torch.nn.Module):
 
     def forward(self, image, focal=None):
         # Preprocess image
-        image = torch.nn.functional.interpolate(
-            image.float(),
-            self.image_resize,
-            mode="bilinear",
-            align_corners=False,
-            antialias=False
-        )
+        image = image.float()
+        if self.image_resize != INPUT_IMAGE_SIZE:
+            image = torch.nn.functional.interpolate(
+                image,
+                self.image_resize,
+                mode="bilinear",
+                align_corners=False,
+                antialias=False
+            )
         x = image * self.inv_image_std_255 - self.image_mean_inv_std
 
         # Patch embedding
@@ -234,8 +306,9 @@ class MoGeV2(torch.nn.Module):
         )
 
         if EDGE_DETECTION:
-            dx = torch.nn.functional.conv2d(depth, self.sobel_x, padding=1)
-            dy = torch.nn.functional.conv2d(depth, self.sobel_y, padding=1)
+            # Apply Sobel filters with the specified kernel size
+            dx = torch.nn.functional.conv2d(depth, self.sobel_x, padding=self.sobel_padding)
+            dy = torch.nn.functional.conv2d(depth, self.sobel_y, padding=self.sobel_padding)
             gradient_map = torch.pow(dx ** 2 + dy ** 2, 0.4)  # Use 0.4 for amplify the small gradient values.
             min_val, max_val = torch.aminmax(gradient_map)    
             gradient_map = (gradient_map - min_val) / (max_val - min_val)  # Normalize to 0 ~ 1
@@ -245,9 +318,10 @@ class MoGeV2(torch.nn.Module):
 
 
 model = MoGeModel.from_pretrained(model_path).to('cpu').eval().float()
-model = MoGeV2(model, INPUT_IMAGE_SIZE, NUM_TOKENS)
+model = MoGeV2(model, INPUT_IMAGE_SIZE, NUM_TOKENS, sobel_kernel_size=SOBEL_KERNEL_SIZE)
 image = torch.ones([1, 3, INPUT_IMAGE_SIZE[0], INPUT_IMAGE_SIZE[1]], dtype=torch.uint8)
 
+print(f'\nUsing Sobel kernel size: {SOBEL_KERNEL_SIZE}x{SOBEL_KERNEL_SIZE}')
 print('\nExport Start.')
 with torch.inference_mode():
     if FOCAL:
@@ -265,7 +339,8 @@ with torch.inference_mode():
             input_names=input_names,
             output_names=['gradient_map'] if EDGE_DETECTION else ['depth_in_meters'],
             do_constant_folding=True,
-            opset_version=17
+            opset_version=17,
+            dynamo=False
         )
     del model
     del in_feed
@@ -370,7 +445,8 @@ plt.axis('off')
 plt.subplot(1, 2, 2)
 # imshow can directly handle the floating-point depth array.
 plt.imshow(depth_map_onnx, cmap='turbo')
-plt.title('Edge Heatmap (from ONNX model)' if EDGE_DETECTION else 'Depth Heatmap (from ONNX model)')
+title_suffix = f' ({SOBEL_KERNEL_SIZE}x{SOBEL_KERNEL_SIZE} Sobel)' if EDGE_DETECTION else ''
+plt.title(f'{"Edge Heatmap" if EDGE_DETECTION else "Depth Heatmap"} (from ONNX model){title_suffix}')
 # Add a color bar to show the mapping of colors to depth values.
 plt.colorbar(label='Normalized Gradient' if EDGE_DETECTION else 'Depth Metric')
 plt.axis('off')
