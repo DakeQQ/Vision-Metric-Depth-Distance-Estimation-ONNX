@@ -238,7 +238,6 @@ class MoGeV2(torch.nn.Module):
         
         self.uv_roi = self.projection_uv[:, self.h_start:self.h_end, self.w_start:self.w_end]
 
-
     def recover_focal_shift(self, points, focal=None, downsample_size=(64, 64)):
         points_lr = torch.nn.functional.interpolate(
             points.permute(0, 3, 1, 2),
@@ -254,7 +253,7 @@ class MoGeV2(torch.nn.Module):
         else:
             return solve_optimal_focal_shift(self.uv_grids[-1], xy, z)
     
-    def forward(self, image, focal=None, threshold=torch.tensor(1.0)):
+    def forward(self, image, threshold, focal=None):
         # Resize input to internal resolution
         image = image.float()
         if self.internal_size != self.output_image_size:
@@ -338,7 +337,7 @@ def export_model_to_onnx():
     model = MoGeV2(model, INPUT_IMAGE_SIZE, NUM_TOKENS, sobel_kernel_size=SOBEL_KERNEL_SIZE)
     
     image = torch.ones([1, 3, INPUT_IMAGE_SIZE[0], INPUT_IMAGE_SIZE[1]], dtype=torch.uint8)
-    threshold_tensor = torch.tensor(DEFAULT_GRAD_THRESHOLD, dtype=torch.float32)
+    threshold_tensor = torch.tensor([DEFAULT_GRAD_THRESHOLD], dtype=torch.float32)
     
     print(f'\nModel Configuration:')
     print(f'  Sobel kernel: {SOBEL_KERNEL_SIZE}x{SOBEL_KERNEL_SIZE}')
@@ -350,10 +349,10 @@ def export_model_to_onnx():
     with torch.inference_mode():
         if FOCAL:
             focal = torch.tensor([FOCAL], dtype=torch.float32)
-            inputs = (image, focal, threshold_tensor)
-            input_names = ['image', 'focal', 'threshold']
+            inputs = (image, threshold_tensor, focal)
+            input_names = ['image', 'threshold', 'focal']
         else:
-            inputs = (image, None, threshold_tensor)
+            inputs = (image, threshold_tensor)
             input_names = ['image', 'threshold']
 
         if OUTPUT_BEV:
@@ -412,7 +411,7 @@ def run_onnx_inference():
     
     input_feed = {input_names[0]: image_tensor}
     if 'threshold' in input_names:
-        input_feed['threshold'] = np.array(DEFAULT_GRAD_THRESHOLD, dtype=np.float32)
+        input_feed['threshold'] = np.array([DEFAULT_GRAD_THRESHOLD], dtype=np.float32)
     if 'focal' in input_names and FOCAL:
         input_feed['focal'] = np.array([FOCAL], dtype=np.float32)
     
