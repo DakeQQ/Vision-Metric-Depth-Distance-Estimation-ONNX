@@ -38,18 +38,18 @@ aspect_ratio = INPUT_IMAGE_SIZE[1] / INPUT_IMAGE_SIZE[0]
 
 FOCAL = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(fov_x * 0.5))
 
-        Camera
-          📷
-         /│\
-        / │ \
-       /  │  \
-      /   │   \
-     /    │    \
-    /     │     \
-   /      │      \
-  /       │       \
- /_______FoV_______\
     Scene width
+ \_______FoV_______/
+  \       │       /
+   \      │      /
+    \     │     /
+     \    │    /
+      \   │   /
+       \  │  /
+        \ │ /
+         \│/
+          📷
+        Camera
 """
 
 
