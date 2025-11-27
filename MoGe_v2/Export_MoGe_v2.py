@@ -21,7 +21,7 @@ FOCAL = None                     # Set None for auto else fixed. FOCAL here is t
 
 OUTPUT_BEV = True                # True for output the bird eye view occupancy map.
 SOBEL_KERNEL_SIZE = 3            # [3, 5] set for gradient map. Smaller is finer.
-DEFAULT_GRAD_THRESHOLD = 0.3     # Set a appropriate value for detected object.
+DEFAULT_GRAD_THRESHOLD = 0.3     # Set a appropriate value for detected object. Smaller is finer.
 BEV_WIDTH_METERS = 10.0
 BEV_DEPTH_METERS = 10.0
 
