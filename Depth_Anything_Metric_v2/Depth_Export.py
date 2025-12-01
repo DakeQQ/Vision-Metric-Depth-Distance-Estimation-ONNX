@@ -7,6 +7,7 @@ import onnxruntime as ort
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+import time
 
 # =================================================================================
 # 1. SETUP AND ONNX EXPORT (Your original code)
@@ -153,5 +154,6 @@ plt.tight_layout()
 plt.show()
 
 print("✅ Visualization complete.")
+
 
 
