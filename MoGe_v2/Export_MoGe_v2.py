@@ -15,16 +15,16 @@ MODEL_PATH = '/home/DakeQQ/Downloads/moge-2-vits-normal/model.pt'   # Only suppo
 ONNX_MODEL_PATH = '/home/DakeQQ/Downloads/MoGe_ONNX/MoGe.onnx'
 TEST_IMAGE_PATH = "./test.jpg"
 
-INPUT_IMAGE_SIZE = [720, 1280]   # Input image shape [Height, Width]. Should be a multiple of GPU group (e.g., 16) for optimal efficiency.
+INPUT_IMAGE_SIZE = [720, 1280]   # Input image shape [Height, Width].
 NUM_TOKENS = 3600                # Larger is finer but slower.
-FOCAL = None                     # Set None for auto else fixed. FOCAL here is the focal length relative to half the image diagonal.
+FOCAL = None                     # Set None for auto else fixed.
 
 OUTPUT_BEV = True                # True for output the bird eye view occupancy map.
 SOBEL_KERNEL_SIZE = 3            # [3, 5] set for gradient map.
-DEFAULT_GRAD_THRESHOLD = 0.3     # Set a appropriate value for detected object.
+DEFAULT_GRAD_THRESHOLD = 0.09    # Set a appropriate value for detected object.
 BEV_WIDTH_METERS = 10.0          # The max width in the image.
 BEV_DEPTH_METERS = 10.0          # The max depth in the image.
-BEV_ROI_START_RATIO = 0.5        # Start position for ROI (0.0 = top, 1.0 = bottom). 0.5 = middle (bottom half).
+BEV_ROI_START_RATIO = 0.5        # Start position for ROI (0.0 = top, 1.0 = bottom).
 OP_SET = 17                      # ONNX Runtime opset.
 
 if PROJECT_PATH not in sys.path:
@@ -32,32 +32,9 @@ if PROJECT_PATH not in sys.path:
 
 from moge.model.v2 import MoGeModel
 
-"""
-fov_x: The horizontal camera FoV in degrees. Smartphone ultra-wide: ~110-120°
-
-aspect_ratio = INPUT_IMAGE_SIZE[1] / INPUT_IMAGE_SIZE[0]
-
-FOCAL = aspect_ratio / (1 + aspect_ratio ** 2) ** 0.5 / torch.tan(torch.deg2rad(fov_x * 0.5))
-
-     Scene width
- \_______FoV_______/
-  \       │       /
-   \      │      /
-    \     │     /
-     \    │    /
-      \   │   /
-       \  │  /
-        \ │ /
-         \│/
-          📷
-        Camera
-"""
-
-
 # ==============================================================================
 # UTILITY FUNCTIONS
 # ==============================================================================
-
 
 def create_normalized_uv_grid(width, height, aspect_ratio):
     """Create normalized UV coordinate grid for the view plane."""
@@ -167,6 +144,9 @@ class MoGeV2(torch.nn.Module):
         # Setup BEV parameters
         self._setup_bev_parameters()
 
+        self.zeros_w = torch.zeros([1, output_image_size[0] // 2 - (sobel_kernel_size - 1) // 2, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_h = torch.zeros([1, (sobel_kernel_size - 1) // 2, output_image_size[1] - (sobel_kernel_size - 1) * 2], dtype=torch.float32)
+
     def _setup_pos_embeddings(self):
         """Prepare positional embeddings for the model."""
         pos_embed = self.model.encoder.backbone.pos_embed
@@ -226,21 +206,26 @@ class MoGeV2(torch.nn.Module):
 
         self.register_buffer('bev_w', torch.tensor(bev_w, dtype=torch.int64))
         self.register_buffer('bev_h', torch.tensor(bev_h, dtype=torch.int64))
-        self.register_buffer('bev_scale_x', torch.tensor(bev_w / BEV_WIDTH_METERS, dtype=torch.float32).view(1, 1, -1))
-        self.register_buffer('bev_offset_x', torch.tensor(bev_w / 2.0, dtype=torch.float32).view(1, 1, -1))
-        self.register_buffer('bev_scale_z', torch.tensor(bev_h / BEV_DEPTH_METERS, dtype=torch.float32).view(1, 1, -1))
-
-        self.bev_map = torch.zeros((bev_h, bev_w), dtype=torch.uint8)
+        
+        # Pre-calculate scalars for projection
+        self.register_buffer('bev_scale_x', torch.tensor(bev_w / BEV_WIDTH_METERS, dtype=torch.float32))
+        self.register_buffer('bev_offset_x', torch.tensor(bev_w / 2.0, dtype=torch.float32))
+        self.register_buffer('bev_scale_z', torch.tensor(bev_h / BEV_DEPTH_METERS, dtype=torch.float32))
 
         # Define ROI based on BEV_ROI_START_RATIO
-        # Clamp ratio between 0.0 and 1.0
         ratio = max(0.0, min(1.0, self.bev_roi_start_ratio))
         self.h_start = int(bev_h * ratio)
         self.h_end = bev_h - self.sobel_padding
         self.w_start = self.sobel_padding
         self.w_end = bev_w - self.sobel_padding
 
-        self.uv_roi = self.projection_uv[:, self.h_start:self.h_end, self.w_start:self.w_end]
+        # Pre-slice and flatten the UV ROI to save time in forward pass
+        # Shape: (1, ROI_H, ROI_W) -> (ROI_H * ROI_W)
+        self.uv_roi_flat = self.projection_uv[:, self.h_start:self.h_end, self.w_start:self.w_end].reshape(-1)
+        
+        # Pre-allocate buffer for the flat BEV map
+        # We use float for scatter_add, then convert to binary
+        self.register_buffer('bev_flat_buffer', torch.zeros(bev_h * bev_w, dtype=torch.int8))
 
     def recover_focal_shift(self, points, focal=None, downsample_size=(64, 64)):
         points_lr = torch.nn.functional.interpolate(
@@ -306,28 +291,44 @@ class MoGeV2(torch.nn.Module):
         depth = (points[..., 2] + shift) * metric_scale
 
         if OUTPUT_BEV:
-            # Compute gradient map
-            dx = torch.nn.functional.conv2d(depth, self.sobel_x, padding=self.sobel_padding)
-            dy = torch.nn.functional.conv2d(depth, self.sobel_y, padding=self.sobel_padding)
-            gradient_map = torch.sqrt(dx ** 2 + dy ** 2)
+            # 1. Compute gradient map
+            depth_roi_flat = depth[..., self.h_start:self.h_end, self.w_start:self.w_end]
 
-            # Generate BEV map from ROI
-            grad_roi = gradient_map[..., self.h_start:self.h_end, self.w_start:self.w_end]
-            depth_roi = depth[..., self.h_start:self.h_end, self.w_start:self.w_end]
+            dx = torch.nn.functional.conv2d(depth_roi_flat, self.sobel_x, padding=0)
+            dy = torch.nn.functional.conv2d(depth_roi_flat, self.sobel_y, padding=0)
+            gradient_map = dx ** 2 + dy ** 2
+            gradient_map = torch.cat([self.zeros_h, gradient_map, self.zeros_h], dim=-2)
+            gradient_map = torch.cat([self.zeros_w, gradient_map, self.zeros_w], dim=-1)
 
-            mask = grad_roi > threshold
-            valid_z = depth_roi[mask]
-            valid_u = self.uv_roi[mask]
 
-            # Project to BEV grid
-            x_idx = (valid_u * valid_z * self.bev_scale_x + self.bev_offset_x).long()
-            z_idx = (valid_z * self.bev_scale_z).long()
+            # 2. Extract ROI and Flatten immediately
+            depth_roi_flat = depth_roi_flat.reshape(-1)
+            grad_roi_flat = gradient_map.reshape(-1)
 
-            x_idx.clamp_(0, self.bev_w - 1)
-            z_idx.clamp_(0, self.bev_h - 1)
+            # 3. Create Binary Mask (Element-wise comparison)
+            mask_flat = (grad_roi_flat > threshold).to(torch.int8)
 
-            self.bev_map[z_idx, x_idx] = 1
-            bev_map = torch.flip(self.bev_map, dims=[0])
+            # 4. Compute BEV Indices for ALL pixels in ROI (Vectorized)
+            x_idx = (self.uv_roi_flat * depth_roi_flat * self.bev_scale_x + self.bev_offset_x).long()
+            z_idx = (depth_roi_flat * self.bev_scale_z).long()
+
+            # 5. Clamp indices to stay within BEV map bounds
+            x_idx = x_idx.clamp(0, self.bev_w - 1)
+            z_idx = z_idx.clamp(0, self.bev_h - 1)
+
+            # 6. Compute Linear Indices for 1D Scatter
+            linear_idx = z_idx * self.bev_w + x_idx
+
+            # 7. Scatter Accumulate
+            self.bev_flat_buffer.scatter_add_(0, linear_idx, mask_flat)
+
+            # 8. Reshape and Binarize
+            bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
+
+            # Flip to match coordinate system (bottom-up) and binarize
+            bev_map = torch.flip(bev_map, dims=[0])
+
+            bev_map = torch.clamp(bev_map, min=0, max=1)
 
             return depth, bev_map
 
