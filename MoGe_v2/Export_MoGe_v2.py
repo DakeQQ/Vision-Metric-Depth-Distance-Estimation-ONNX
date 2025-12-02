@@ -226,9 +226,9 @@ class MoGeV2(torch.nn.Module):
 
         self.register_buffer('bev_w', torch.tensor(bev_w, dtype=torch.int64))
         self.register_buffer('bev_h', torch.tensor(bev_h, dtype=torch.int64))
-        self.register_buffer('bev_scale_x', torch.tensor(bev_w / BEV_WIDTH_METERS, dtype=torch.float32))
-        self.register_buffer('bev_offset_x', torch.tensor(bev_w / 2.0, dtype=torch.float32))
-        self.register_buffer('bev_scale_z', torch.tensor(bev_h / BEV_DEPTH_METERS, dtype=torch.float32))
+        self.register_buffer('bev_scale_x', torch.tensor(bev_w / BEV_WIDTH_METERS, dtype=torch.float32).view(1, 1, -1))
+        self.register_buffer('bev_offset_x', torch.tensor(bev_w / 2.0, dtype=torch.float32).view(1, 1, -1))
+        self.register_buffer('bev_scale_z', torch.tensor(bev_h / BEV_DEPTH_METERS, dtype=torch.float32).view(1, 1, -1))
 
         self.bev_map = torch.zeros((bev_h, bev_w), dtype=torch.uint8)
 
