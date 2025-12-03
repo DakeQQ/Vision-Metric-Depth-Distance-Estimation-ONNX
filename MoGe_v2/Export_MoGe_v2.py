@@ -16,12 +16,12 @@ ONNX_MODEL_PATH = '/home/DakeQQ/Downloads/MoGe_ONNX/MoGe.onnx'
 TEST_IMAGE_PATH = "./test.jpg"
 
 INPUT_IMAGE_SIZE = [720, 1280]   # Input image shape [Height, Width].
-NUM_TOKENS = 800                # Larger is finer but slower.
+NUM_TOKENS = 3600                # Larger is finer but slower.
 FOCAL = None                     # Set None for auto else fixed.
 
 OUTPUT_BEV = True                # True for output the bird eye view occupancy map.
 SOBEL_KERNEL_SIZE = 3            # [3, 5] set for gradient map.
-DEFAULT_GRAD_THRESHOLD = 0.1    # Set a appropriate value for detected object.
+DEFAULT_GRAD_THRESHOLD = 0.1     # Set a appropriate value for detected object.
 BEV_WIDTH_METERS = 10.0          # The max width in the image.
 BEV_DEPTH_METERS = 10.0          # The max depth in the image.
 BEV_ROI_START_RATIO = 0.5        # Start position for ROI (0.0 = top, 1.0 = bottom).
