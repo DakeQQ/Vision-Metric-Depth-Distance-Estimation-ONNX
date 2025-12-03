@@ -23,7 +23,7 @@ test_image_path = "./test.jpg"
 # --- BEV Configuration ---
 OUTPUT_BEV = True                # True for output the bird eye view occupancy map.
 SOBEL_KERNEL_SIZE = 3            # [3, 5] set for gradient map.
-DEFAULT_GRAD_THRESHOLD = 0.09    # Set a appropriate value for detected object.
+DEFAULT_GRAD_THRESHOLD = 0.01    # Set a appropriate value for detected object.
 BEV_WIDTH_METERS = 10.0          # The max width in the image.
 BEV_DEPTH_METERS = MAX_DEPTH     # The max depth in the image.
 BEV_ROI_START_RATIO = 0.5        # Start position for ROI (0.0 = top, 1.0 = bottom).
@@ -72,7 +72,7 @@ def create_normalized_uv_grid(width, height, aspect_ratio):
 
 
 # =================================================================================
-# OPTIMIZED MODEL WRAPPER WITH REFERENCE.PY BEV APPROACH
+# OPTIMIZED MODEL WRAPPER
 # =================================================================================
 
 class DepthAnythingV2Wrapper(torch.nn.Module):
@@ -88,26 +88,21 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
         self.sobel_x, self.sobel_y = get_sobel_kernels(sobel_kernel_size)
         self.sobel_padding = sobel_kernel_size // 2
 
-        # Setup UV grid FIRST (before BEV parameters)
+        # Setup UV grid (u and v coordinates)
         self._setup_uv_grid()
 
-        # Setup BEV parameters (needs self.projection_uv from above)
+        # Setup BEV parameters
         self._setup_bev_parameters(bev_width_meters, bev_depth_meters, sobel_kernel_size)
 
-        # Zero padding buffers for gradient map
-        self.zeros_w = torch.zeros([1, 1, int(self.h * (1 - self.bev_roi_start_ratio)), (sobel_kernel_size - 1) // 2], dtype=torch.float32)
-        self.zeros_w_plus = torch.zeros([1, 1, int(self.h * (1 - self.bev_roi_start_ratio)) + 1, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
-        self.zeros_w_minus = torch.zeros([1, 1, int(self.h * (1 - self.bev_roi_start_ratio)) - 1, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
-        self.zeros_h = torch.zeros([1, 1, (sobel_kernel_size - 1) // 2, self.w - (sobel_kernel_size - 1) * 2], dtype=torch.float32)
-
     def _setup_uv_grid(self):
-        """Setup UV projection grid (u-coordinate only)."""
+        """Setup UV projection grid."""
         aspect_ratio = self.w / self.h
         projection_uv = create_normalized_uv_grid(self.w, self.h, aspect_ratio)
-        self.projection_uv = projection_uv.permute(2, 0, 1)[0].unsqueeze(0)
+        # Permute to (1, 2, H, W) -> Channel 0 is U, Channel 1 is V
+        self.projection_uv = projection_uv.permute(2, 0, 1).unsqueeze(0)
 
     def _setup_bev_parameters(self, bev_width_meters, bev_depth_meters, sobel_kernel_size):
-        """Setup BEV map parameters and ROI bounds based on BEV_ROI_START_RATIO."""
+        """Setup BEV map parameters and ROI bounds."""
         bev_h, bev_w = self.h, self.w
 
         self.register_buffer('bev_w', torch.tensor(bev_w, dtype=torch.int64))
@@ -118,19 +113,21 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
         self.register_buffer('bev_offset_x', torch.tensor(bev_w / 2.0, dtype=torch.float32))
         self.register_buffer('bev_scale_z', torch.tensor(bev_h / bev_depth_meters, dtype=torch.float32))
 
-        # Define ROI based on BEV_ROI_START_RATIO
+        # Define ROI
         ratio = max(0.0, min(1.0, self.bev_roi_start_ratio))
         self.h_start = int(bev_h * ratio)
         self.h_end = bev_h - self.sobel_padding
         self.w_start = self.sobel_padding
         self.w_end = bev_w - self.sobel_padding
 
-        # Pre-slice and flatten the UV ROI to save time in forward pass
-        # Shape: (1, ROI_H, ROI_W) -> (ROI_H * ROI_W)
-        self.uv_roi_flat = self.projection_uv[:, self.h_start:self.h_end, self.w_start:self.w_end].reshape(-1)
+        # Slice UV grids for ROI
+        # U-coordinate for BEV projection: (1, ROI_H, ROI_W) -> Flatten
+        self.uv_roi_u_flat = self.projection_uv[:, 0, self.h_start:self.h_end, self.w_start:self.w_end].reshape(-1)
 
-        # Pre-allocate buffer for the flat BEV map
-        # We use int8 for scatter_add, then convert to binary
+        # V-coordinate for Height calculation: (1, 1, ROI_H, ROI_W) - Keep spatial dims for multiplication
+        self.uv_roi_v = self.projection_uv[:, 1:2, self.h_start:self.h_end, self.w_start:self.w_end]
+
+        # Buffer for BEV map
         self.register_buffer('bev_flat_buffer', torch.zeros(bev_h * bev_w, dtype=torch.int8))
 
     def forward(self, image, threshold):
@@ -146,46 +143,44 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
                 align_corners=False
             )
         if OUTPUT_BEV:
-            # 1. Compute gradient map
-            depth_roi_flat = depth[..., self.h_start:self.h_end, self.w_start:self.w_end]
+            # 1. Extract ROI Depth
+            depth_roi = depth[..., self.h_start:self.h_end, self.w_start:self.w_end]
 
-            dx = torch.nn.functional.conv2d(depth_roi_flat, self.sobel_x, padding=0)
-            dy = torch.nn.functional.conv2d(depth_roi_flat, self.sobel_y, padding=0)
+            # 2. Calculate Height Proxy (H = Depth * v)
+            height_map_roi = depth_roi * self.uv_roi_v
+
+            # 3. Compute Gradients on HEIGHT MAP
+            dx = torch.nn.functional.conv2d(height_map_roi, self.sobel_x, padding=0)
+            dy = torch.nn.functional.conv2d(height_map_roi, self.sobel_y, padding=0)
             gradient_map = dx ** 2 + dy ** 2
-            gradient_map = torch.cat([self.zeros_h, gradient_map, self.zeros_h], dim=-2)
-            if self.zeros_w.shape[-2] - gradient_map.shape[-2] == 1:
-                gradient_map = torch.cat([self.zeros_w_minus, gradient_map, self.zeros_w_minus], dim=-1)
-            elif self.zeros_w.shape[-2] - gradient_map.shape[-2] == -1:
-                gradient_map = torch.cat([self.zeros_w_plus, gradient_map, self.zeros_w_plus], dim=-1)
-            else:
-                gradient_map = torch.cat([self.zeros_w, gradient_map, self.zeros_w], dim=-1)
 
-            # 2. Extract ROI and Flatten immediately
-            depth_roi_flat = depth_roi_flat.reshape(-1)
+            # 4. Pad back to ROI size (Matches Reference.py)
+            # Padding order: (left, right, top, bottom)
+            pad_size = self.sobel_padding
+            gradient_map = torch.nn.functional.pad(
+                gradient_map, 
+                (pad_size, pad_size, pad_size, pad_size), 
+                mode='constant', 
+                value=0
+            )
+
+            # 5. Flatten
+            depth_roi_flat = depth_roi.reshape(-1)
             grad_roi_flat = gradient_map.reshape(-1)
 
-            # 3. Create Binary Mask (Element-wise comparison)
+            # 6. Create Binary Mask
             mask_flat = (grad_roi_flat > threshold).to(torch.int8)
 
-            # 4. Compute BEV Indices for ALL pixels in ROI (Vectorized)
-            x_idx = (self.uv_roi_flat * depth_roi_flat * self.bev_scale_x + self.bev_offset_x).long()
+            # 7. Compute BEV Indices
+            x_idx = (self.uv_roi_u_flat * depth_roi_flat * self.bev_scale_x + self.bev_offset_x).long()
             z_idx = (depth_roi_flat * self.bev_scale_z).long()
 
-            # 5. Clamp indices to stay within BEV map bounds
-            x_idx = x_idx.clamp(0, self.bev_w - 1)
-            z_idx = z_idx.clamp(0, self.bev_h - 1)
-
-            # 6. Compute Linear Indices for 1D Scatter
+            # 8. Scatter Accumulate
             linear_idx = z_idx * self.bev_w + x_idx
-
-            # 7. Scatter Accumulate
             self.bev_flat_buffer.scatter_add_(0, linear_idx, mask_flat)
 
-            # 8. Reshape and Binarize
+            # 9. Reshape, and Clamp
             bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
-
-            # Flip to match coordinate system (bottom-up) and binarize
-            bev_map = torch.flip(bev_map, dims=[0])
             bev_map = torch.clamp(bev_map, min=0, max=1)
 
             return depth.squeeze(), bev_map
@@ -316,14 +311,14 @@ elapsed = time.time() - start
 print(f'⏱️  Inference time: {elapsed:.3f} seconds')
 
 depth_out = results[0]
-bev_out = results[1] if len(output_names_ort) > 1 else None
+bev_map = results[1] if len(output_names_ort) > 1 else None
 
 print(f"\nDepth output dtype: {depth_out.dtype}, shape: {depth_out.shape}")
 print(f"Depth range (meters): [{depth_out.min():.3f}, {depth_out.max():.3f}]")
 
-if bev_out is not None:
-    print(f"BEV output dtype: {bev_out.dtype}, shape: {bev_out.shape}")
-    print(f"BEV value range: [{bev_out.min()}, {bev_out.max()}]")
+if bev_map is not None:
+    print(f"BEV output dtype: {bev_map.dtype}, shape: {bev_map.shape}")
+    print(f"BEV value range: [{bev_map.min()}, {bev_map.max()}]")
 
 # =================================================================================
 # 3. VISUALIZATION
@@ -350,17 +345,24 @@ ax2.set_title(f'Depth Map (ROI starts at y={roi_start_pixel})')
 plt.colorbar(im, ax=ax2, label='Depth (m)', fraction=0.046, pad=0.04)
 ax2.axis('off')
 
-if bev_out is not None:
-    # BEV Occupancy
+if bev_map is not None:
     ax3 = plt.subplot(1, 3, 3)
-    extent = [-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS]
-    ax3.imshow(bev_out, cmap='Greys', interpolation='bilinear', extent=extent, aspect='auto')
-    ax3.plot(0, 0, 'ro', markersize=8, label='Camera Position')
-    ax3.set_title(f'BEV Occupancy Map ({input_w}×{input_h})')
+    # origin='lower' ensures 0m is at the bottom
+    ax3.imshow(bev_map, cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
+    ax3.set_title("BEV Occupancy (Height-based)")
+
+    # Add Grid
+    ax3.grid(True, which='both', color='green', linestyle='--', linewidth=0.5, alpha=0.5)
+
+    # Add Labels
     ax3.set_xlabel('Lateral Distance (m)')
     ax3.set_ylabel('Longitudinal Distance (m)')
-    ax3.legend()
-    ax3.grid(True, color='green', linestyle='--', alpha=0.3)
+
+    # Add Camera Position
+    # Plot a red dot at (0,0) to represent the camera
+    ax3.plot(0, 0, 'ro', markersize=8, label='Camera Position')
+    ax3.legend(loc='upper right')
+
 
 plt.tight_layout()
 plt.show()
