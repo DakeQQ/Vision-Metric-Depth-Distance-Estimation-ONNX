@@ -95,9 +95,10 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
         self._setup_bev_parameters(bev_width_meters, bev_depth_meters, sobel_kernel_size)
 
         # Zero padding buffers for gradient map
-        self.zeros_w = torch.zeros([1, 1, self.h // 2 - (sobel_kernel_size - 1) // 2, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_w = torch.zeros([1, 1, int(self.h * (1 - self.bev_roi_start_ratio)), (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_w_plus = torch.zeros([1, 1, int(self.h * (1 - self.bev_roi_start_ratio)) + 1, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_w_minus = torch.zeros([1, 1, int(self.h * (1 - self.bev_roi_start_ratio)) - 1, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
         self.zeros_h = torch.zeros([1, 1, (sobel_kernel_size - 1) // 2, self.w - (sobel_kernel_size - 1) * 2], dtype=torch.float32)
-
 
     def _setup_uv_grid(self):
         """Setup UV projection grid (u-coordinate only)."""
@@ -152,7 +153,12 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
             dy = torch.nn.functional.conv2d(depth_roi_flat, self.sobel_y, padding=0)
             gradient_map = dx ** 2 + dy ** 2
             gradient_map = torch.cat([self.zeros_h, gradient_map, self.zeros_h], dim=-2)
-            gradient_map = torch.cat([self.zeros_w, gradient_map, self.zeros_w], dim=-1)
+            if self.zeros_w.shape[-2] - gradient_map.shape[-2] == 1:
+                gradient_map = torch.cat([self.zeros_w_minus, gradient_map, self.zeros_w_minus], dim=-1)
+            elif self.zeros_w.shape[-2] - gradient_map.shape[-2] == -1:
+                gradient_map = torch.cat([self.zeros_w_plus, gradient_map, self.zeros_w_plus], dim=-1)
+            else:
+                gradient_map = torch.cat([self.zeros_w, gradient_map, self.zeros_w], dim=-1)
 
             # 2. Extract ROI and Flatten immediately
             depth_roi_flat = depth_roi_flat.reshape(-1)
