@@ -144,8 +144,8 @@ class MoGeV2(torch.nn.Module):
         # Setup BEV parameters
         self._setup_bev_parameters()
 
-        self.zeros_w = torch.zeros([1, output_image_size[0] // 2 - (sobel_kernel_size - 1) // 2, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
-        self.zeros_h = torch.zeros([1, (sobel_kernel_size - 1) // 2, output_image_size[1] - (sobel_kernel_size - 1) * 2], dtype=torch.float32)
+        self.zeros_w = torch.zeros([1, 1, output_image_size[0] // 2 - (sobel_kernel_size - 1) // 2, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_h = torch.zeros([1, 1, (sobel_kernel_size - 1) // 2, output_image_size[1] - (sobel_kernel_size - 1) * 2], dtype=torch.float32)
 
     def _setup_pos_embeddings(self):
         """Prepare positional embeddings for the model."""
@@ -290,6 +290,12 @@ class MoGeV2(torch.nn.Module):
         # Compute depth
         depth = (points[..., 2] + shift) * metric_scale
 
+        if list(depth.shape[-2:]) != self.output_image_size:
+            depth = torch.nn.functional.interpolate(
+                depth.unsqueeze(0), self.output_image_size, mode="bilinear",
+                align_corners=False, antialias=False
+            )
+
         if OUTPUT_BEV:
             # 1. Compute gradient map
             depth_roi_flat = depth[..., self.h_start:self.h_end, self.w_start:self.w_end]
@@ -330,9 +336,9 @@ class MoGeV2(torch.nn.Module):
 
             bev_map = torch.clamp(bev_map, min=0, max=1)
 
-            return depth, bev_map
+            return depth.squeeze(), bev_map
 
-        return depth
+        return depth.squeeze()
 
 
 # ==============================================================================
@@ -439,7 +445,7 @@ def run_onnx_inference():
     elapsed = time.time() - start
     print(f'⏱️  Inference time: {elapsed:.3f} seconds')
 
-    return resized_img, results[0][0], results[1] if len(output_names) > 1 else None
+    return resized_img, results[0], results[1] if len(output_names) > 1 else None
 
 
 # ==============================================================================
@@ -501,3 +507,4 @@ if __name__ == "__main__":
 
     # Visualize results
     visualize_results(input_img, depth, bev)
+    
