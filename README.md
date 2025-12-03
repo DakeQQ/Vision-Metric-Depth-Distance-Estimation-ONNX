@@ -17,6 +17,6 @@
 
 ###  MoGe-v2-vits
 <br>
-<img width="1816" height="603" alt="image" src="https://github.com/user-attachments/assets/91e4e41d-accd-4af5-9b84-f45d4547cf3e" />
+<img width="1910" height="646" alt="Screenshot from 2025-12-03 16-31-13" src="https://github.com/user-attachments/assets/6bad3d93-9ba6-4d44-b9b5-da767edec011" />
 
 ---
