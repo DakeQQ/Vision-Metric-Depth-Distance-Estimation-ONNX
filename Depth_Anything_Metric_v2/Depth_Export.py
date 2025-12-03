@@ -24,7 +24,7 @@ test_image_path = "./test.jpg"
 OUTPUT_BEV = True                # True for output the bird eye view occupancy map.
 SOBEL_KERNEL_SIZE = 3            # [3, 5] set for gradient map.
 DEFAULT_GRAD_THRESHOLD = 0.01    # Set a appropriate value for detected object.
-BEV_WIDTH_METERS = 10.0          # The max width in the image.
+BEV_WIDTH_METERS = MAX_DEPTH     # The max width in the image.
 BEV_DEPTH_METERS = MAX_DEPTH     # The max depth in the image.
 BEV_ROI_START_RATIO = 0.5        # Start position for ROI (0.0 = top, 1.0 = bottom).
 OP_SET = 17                      # ONNX Runtime opset.
@@ -379,3 +379,4 @@ print(f"BEV format: Binary int8 (0 = free space, 1 = occupied)")
 print(f"Threshold: {DEFAULT_GRAD_THRESHOLD} (gradient magnitude threshold)")
 print("=" * 70)
 print("✅ Done.")
+
