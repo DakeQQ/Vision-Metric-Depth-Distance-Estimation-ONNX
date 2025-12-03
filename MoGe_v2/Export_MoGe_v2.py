@@ -289,11 +289,11 @@ class MoGeV2(torch.nn.Module):
         shift = self.recover_focal_shift(points, focal=focal)
 
         # Compute depth
-        depth = (points[..., 2] + shift) * metric_scale
+        depth = ((points[..., 2] + shift) * metric_scale).unsqueeze(0)
 
         if list(depth.shape[-2:]) != self.output_image_size:
             depth = torch.nn.functional.interpolate(
-                depth.unsqueeze(0), self.output_image_size, mode="bilinear",
+                depth, self.output_image_size, mode="bilinear",
                 align_corners=False, antialias=False
             )
 
