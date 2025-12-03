@@ -16,12 +16,12 @@ ONNX_MODEL_PATH = '/home/DakeQQ/Downloads/MoGe_ONNX/MoGe.onnx'
 TEST_IMAGE_PATH = "./test.jpg"
 
 INPUT_IMAGE_SIZE = [720, 1280]   # Input image shape [Height, Width].
-NUM_TOKENS = 3600                # Larger is finer but slower.
+NUM_TOKENS = 800                # Larger is finer but slower.
 FOCAL = None                     # Set None for auto else fixed.
 
 OUTPUT_BEV = True                # True for output the bird eye view occupancy map.
 SOBEL_KERNEL_SIZE = 3            # [3, 5] set for gradient map.
-DEFAULT_GRAD_THRESHOLD = 0.09    # Set a appropriate value for detected object.
+DEFAULT_GRAD_THRESHOLD = 0.1    # Set a appropriate value for detected object.
 BEV_WIDTH_METERS = 10.0          # The max width in the image.
 BEV_DEPTH_METERS = 10.0          # The max depth in the image.
 BEV_ROI_START_RATIO = 0.5        # Start position for ROI (0.0 = top, 1.0 = bottom).
@@ -143,8 +143,9 @@ class MoGeV2(torch.nn.Module):
 
         # Setup BEV parameters
         self._setup_bev_parameters()
-
-        self.zeros_w = torch.zeros([1, 1, output_image_size[0] // 2 - (sobel_kernel_size - 1) // 2, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_w = torch.zeros([1, 1, int(output_image_size[0] * (1 - self.bev_roi_start_ratio)), (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_w_plus = torch.zeros([1, 1, int(output_image_size[0] * (1 - self.bev_roi_start_ratio)) + 1, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_w_minus = torch.zeros([1, 1, int(output_image_size[0] * (1 - self.bev_roi_start_ratio)) - 1, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
         self.zeros_h = torch.zeros([1, 1, (sobel_kernel_size - 1) // 2, output_image_size[1] - (sobel_kernel_size - 1) * 2], dtype=torch.float32)
 
     def _setup_pos_embeddings(self):
@@ -304,8 +305,12 @@ class MoGeV2(torch.nn.Module):
             dy = torch.nn.functional.conv2d(depth_roi_flat, self.sobel_y, padding=0)
             gradient_map = dx ** 2 + dy ** 2
             gradient_map = torch.cat([self.zeros_h, gradient_map, self.zeros_h], dim=-2)
-            gradient_map = torch.cat([self.zeros_w, gradient_map, self.zeros_w], dim=-1)
-
+            if self.zeros_w.shape[-2] - gradient_map.shape[-2] == 1:
+                gradient_map = torch.cat([self.zeros_w_minus, gradient_map, self.zeros_w_minus], dim=-1)
+            elif self.zeros_w.shape[-2] - gradient_map.shape[-2] == -1:
+                gradient_map = torch.cat([self.zeros_w_plus, gradient_map, self.zeros_w_plus], dim=-1)
+            else:
+                gradient_map = torch.cat([self.zeros_w, gradient_map, self.zeros_w], dim=-1)
 
             # 2. Extract ROI and Flatten immediately
             depth_roi_flat = depth_roi_flat.reshape(-1)
