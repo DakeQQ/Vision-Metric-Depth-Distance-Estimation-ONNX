@@ -1,12 +1,13 @@
+import os
+import sys
+import cv2
+import time
 import torch
 import shutil
-import sys
-import os
 import onnxruntime as ort
 import numpy as np
-import cv2
 import matplotlib.pyplot as plt
-import time
+
 from depth_config import EXPORT_MODEL_ENCODER_TYPE, EXPORT_DEPTH_INPUT_SIZE, MAX_DEPTH
 
 # =================================================================================
@@ -94,8 +95,8 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
         self._setup_bev_parameters(bev_width_meters, bev_depth_meters, sobel_kernel_size)
 
         # Zero padding buffers for gradient map
-        self.zeros_w = torch.zeros([1, self.h // 2 - (sobel_kernel_size - 1) // 2, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
-        self.zeros_h = torch.zeros([1, (sobel_kernel_size - 1) // 2, self.w - (sobel_kernel_size - 1) * 2], dtype=torch.float32)
+        self.zeros_w = torch.zeros([1, 1, self.h // 2 - (sobel_kernel_size - 1) // 2, (sobel_kernel_size - 1) // 2], dtype=torch.float32)
+        self.zeros_h = torch.zeros([1, 1, (sobel_kernel_size - 1) // 2, self.w - (sobel_kernel_size - 1) * 2], dtype=torch.float32)
 
 
     def _setup_uv_grid(self):
@@ -143,7 +144,6 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
                 mode='bilinear',
                 align_corners=False
             )
-        depth = depth.squeeze(0)
         if OUTPUT_BEV:
             # 1. Compute gradient map
             depth_roi_flat = depth[..., self.h_start:self.h_end, self.w_start:self.w_end]
@@ -182,9 +182,9 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
             bev_map = torch.flip(bev_map, dims=[0])
             bev_map = torch.clamp(bev_map, min=0, max=1)
 
-            return depth, bev_map
+            return depth.squeeze(), bev_map
 
-        return depth
+        return depth.squeeze()
 
 
 # =================================================================================
@@ -309,7 +309,7 @@ results = ort_session.run(output_names_ort, input_feed)
 elapsed = time.time() - start
 print(f'⏱️  Inference time: {elapsed:.3f} seconds')
 
-depth_out = results[0][0]
+depth_out = results[0]
 bev_out = results[1] if len(output_names_ort) > 1 else None
 
 print(f"\nDepth output dtype: {depth_out.dtype}, shape: {depth_out.shape}")
