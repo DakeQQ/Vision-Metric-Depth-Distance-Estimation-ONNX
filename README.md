@@ -11,8 +11,8 @@
 |:------------:|:------------:|:-----------------:|:------------:|:------------------------------------------------:|
 | Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | MoGe-v2-vits <br> f32 | 3.4                                    |
 | Ubuntu-24.04 | Laptop       | GPU <br> MX150 | MoGe-v2-vits <br> f32 | 1.5                                        |
-| Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | DepthAnything-v2-vits <br> f32 | 0.32                          |
-| Ubuntu-24.04 | Laptop       | GPU <br> MX150 | DepthAnything-v2-vits <br> f32 | 0.26                              |
+| Ubuntu-24.04 | Laptop       | CPU <br> i7-1165G7 | DepthAnything-v2-vits <br> f32 | 0.32 <br> (Internal Resized: 294*518) |
+| Ubuntu-24.04 | Laptop       | GPU <br> MX150 | DepthAnything-v2-vits <br> f32 | 0.26 <br> (Internal Resized: 294*518)     |
 
 
 ---
