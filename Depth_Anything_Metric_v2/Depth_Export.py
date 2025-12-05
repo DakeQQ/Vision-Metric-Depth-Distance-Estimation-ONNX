@@ -105,13 +105,13 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
         """Setup BEV map parameters and ROI bounds."""
         bev_h, bev_w = self.h, self.w
 
-        self.register_buffer('bev_w', torch.tensor(bev_w, dtype=torch.int64))
-        self.register_buffer('bev_h', torch.tensor(bev_h, dtype=torch.int64))
+        self.register_buffer('bev_w', torch.tensor([bev_w], dtype=torch.int32))
+        self.register_buffer('bev_h', torch.tensor([bev_h], dtype=torch.int64))
 
         # Pre-calculate scalars for projection
-        self.register_buffer('bev_scale_x', torch.tensor(bev_w / bev_width_meters, dtype=torch.float32))
-        self.register_buffer('bev_offset_x', torch.tensor(bev_w / 2.0, dtype=torch.float32))
-        self.register_buffer('bev_scale_z', torch.tensor(bev_h / bev_depth_meters, dtype=torch.float32))
+        self.register_buffer('bev_scale_x', torch.tensor([bev_w / bev_width_meters], dtype=torch.float32))
+        self.register_buffer('bev_offset_x', torch.tensor([bev_w / 2.0], dtype=torch.float32))
+        self.register_buffer('bev_scale_z', torch.tensor([bev_h / bev_depth_meters], dtype=torch.float32))
 
         # Define ROI
         ratio = max(0.0, min(1.0, self.bev_roi_start_ratio))
@@ -128,7 +128,7 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
         self.uv_roi_v = self.projection_uv[:, 1:2, self.h_start:self.h_end, self.w_start:self.w_end]
 
         # Buffer for BEV map
-        self.register_buffer('bev_flat_buffer', torch.zeros(bev_h * bev_w, dtype=torch.int8))
+        self.register_buffer('bev_flat_buffer', torch.zeros(bev_h * bev_w, dtype=torch.uint8))
 
     def forward(self, image, threshold):
         # Base model inference
@@ -169,19 +169,18 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
             grad_roi_flat = gradient_map.reshape(-1)
 
             # 6. Create Binary Mask
-            mask_flat = (grad_roi_flat > threshold).to(torch.int8)
+            mask_flat = (grad_roi_flat > threshold).to(torch.uint8)
 
             # 7. Compute BEV Indices
-            x_idx = (self.uv_roi_u_flat * depth_roi_flat * self.bev_scale_x + self.bev_offset_x).long()
-            z_idx = (depth_roi_flat * self.bev_scale_z).long()
+            x_idx = (self.uv_roi_u_flat * depth_roi_flat * self.bev_scale_x + self.bev_offset_x).int()
+            z_idx = (depth_roi_flat * self.bev_scale_z).int()
 
             # 8. Scatter Accumulate
             linear_idx = z_idx * self.bev_w + x_idx
             self.bev_flat_buffer.scatter_add_(0, linear_idx, mask_flat)
 
             # 9. Reshape, and Clamp
-            bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
-            bev_map = torch.clamp(bev_map, min=0, max=1)
+            bev_map = torch.clamp(self.bev_flat_buffer, min=0, max=1).view(self.bev_h, self.bev_w)
 
             return depth.squeeze(), bev_map
 
@@ -379,4 +378,3 @@ print(f"BEV format: Binary int8 (0 = free space, 1 = occupied)")
 print(f"Threshold: {DEFAULT_GRAD_THRESHOLD} (gradient magnitude threshold)")
 print("=" * 70)
 print("✅ Done.")
-
