@@ -37,8 +37,6 @@ from moge.model.v2 import MoGeModel
 # ==============================================================================
 # UTILITY FUNCTIONS
 # ==============================================================================
-
-
 def create_normalized_uv_grid(width, height, aspect_ratio):
     """Create normalized UV coordinate grid for the view plane."""
     denom = (1 + aspect_ratio ** 2) ** 0.5
@@ -100,15 +98,15 @@ def get_sobel_kernels(kernel_size):
     sobel_x, sobel_y = kernels[kernel_size]
     return sobel_x.view(1, 1, kernel_size, kernel_size), sobel_y.view(1, 1, kernel_size, kernel_size)
 
+
 # ==============================================================================
 # MODEL WRAPPER
 # ==============================================================================
-
-
 class MoGeV2(torch.nn.Module):
     def __init__(self, model, output_image_size, num_tokens, sobel_kernel_size=3, bev_roi_start_ratio=0.5):
         super().__init__()
         self.model = model
+        self._replace_gelu_with_tanh_approximation(self.model)
         self.output_image_size = output_image_size
         self.aspect_ratio = output_image_size[1] / output_image_size[0]
         self.bev_roi_start_ratio = bev_roi_start_ratio
@@ -134,6 +132,23 @@ class MoGeV2(torch.nn.Module):
 
         # BEV Setup
         self._setup_bev_parameters()
+
+        self.a = torch.zeros([1, 1, 1, 1276], dtype=torch.float32)
+        self.b = torch.zeros([1, 1, 359, 1], dtype=torch.float32)
+
+    def _replace_gelu_with_tanh_approximation(self, module):
+        """
+        Recursively replace all GELU(approximate='none' or None)
+        with GELU(approximate='tanh') in the module tree
+        """
+        for name, child in module.named_children():
+            if isinstance(child, torch.nn.GELU):
+                # Replace with tanh approximation version
+                setattr(module, name, torch.nn.GELU(approximate='tanh'))
+                print(f"Replaced GELU at: {name}")
+            else:
+                # Recursively apply to child modules
+                self._replace_gelu_with_tanh_approximation(child)
 
     def _setup_pos_embeddings(self):
         pos_embed = self.model.encoder.backbone.pos_embed
@@ -258,7 +273,9 @@ class MoGeV2(torch.nn.Module):
 
             # Pad back to ROI size using ONNX-friendly 'replicate' or 'constant'
             # We lost 'sobel_padding' pixels on each side during conv2d
-            gradient_map = torch.nn.functional.pad(gradient_map, (self.sobel_padding, self.sobel_padding, self.sobel_padding, self.sobel_padding), mode='constant', value=0)
+            # gradient_map = torch.nn.functional.pad(gradient_map, (self.sobel_padding, self.sobel_padding, self.sobel_padding, self.sobel_padding), mode='constant', value=0)
+            gradient_map = torch.cat([self.a, gradient_map, self.a], dim=-2)
+            gradient_map = torch.cat([self.b, gradient_map, self.b], dim=-1)
 
             # Flatten
             depth_roi_flat = depth_roi.reshape(-1)
@@ -275,10 +292,10 @@ class MoGeV2(torch.nn.Module):
             linear_idx = z_idx * self.bev_w + x_idx
             self.bev_flat_buffer.scatter_add_(0, linear_idx, mask_flat)
 
-            # Output
-            bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
+            # Output, No need to reshape back for ONNX Runtime C-API.
+            # bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
 
-            return depth.squeeze(), bev_map
+            return depth.squeeze(), self.bev_flat_buffer
 
         return depth.squeeze()
 
@@ -286,8 +303,6 @@ class MoGeV2(torch.nn.Module):
 # ==============================================================================
 # EXPORT TO ONNX
 # ==============================================================================
-
-
 def export_model_to_onnx():
     print("Loading model for export...")
     model = MoGeModel.from_pretrained(MODEL_PATH).to('cpu').eval().float()
@@ -315,8 +330,6 @@ def export_model_to_onnx():
 # ==============================================================================
 # ONNX INFERENCE & VISUALIZATION
 # ==============================================================================
-
-
 def run_onnx_inference():
     session_opts = onnxruntime.SessionOptions()
     session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -351,8 +364,6 @@ def run_onnx_inference():
 # ==============================================================================
 # VISUALIZATION (Restored to Original Quality)
 # ==============================================================================
-
-
 def visualize_results(input_image, depth_map, bev_map):
     """Display input, depth, and BEV maps with consistent sizing and professional formatting."""
     print("\n📊 Generating visualization...")
@@ -389,7 +400,7 @@ def visualize_results(input_image, depth_map, bev_map):
     if bev_map is not None:
         ax3 = plt.subplot(1, 3, 3)
         # origin='lower' ensures 0m is at the bottom
-        ax3.imshow(bev_map * 255, cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
+        ax3.imshow((bev_map * 255).reshape(INPUT_IMAGE_SIZE), cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
         ax3.set_title("BEV Occupancy (Height-based)")
 
         # Add Grid
@@ -412,7 +423,6 @@ def visualize_results(input_image, depth_map, bev_map):
 # ==============================================================================
 # MAIN EXECUTION
 # ==============================================================================
-
 if __name__ == "__main__":
     # 1. Export model
     export_model_to_onnx()
