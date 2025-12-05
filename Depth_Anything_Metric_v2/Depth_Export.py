@@ -13,7 +13,6 @@ from depth_config import EXPORT_MODEL_ENCODER_TYPE, EXPORT_DEPTH_INPUT_SIZE, MAX
 # =================================================================================
 # CONFIGURATION
 # =================================================================================
-
 # --- Paths ---
 model_path = "/home/DakeQQ/Downloads/depth_anything_v2_metric_hypersim_vits.pth"
 depth_metric_path = "/home/DakeQQ/Downloads/Depth-Anything-V2-main/metric_depth/depth_anything_v2"
@@ -33,7 +32,6 @@ OP_SET = 17                      # ONNX Runtime opset.
 # =================================================================================
 # HELPER FUNCTIONS
 # =================================================================================
-
 def get_sobel_kernels(kernel_size):
     """Return Sobel kernels for gradient computation."""
     kernels = {
@@ -74,12 +72,12 @@ def create_normalized_uv_grid(width, height, aspect_ratio):
 # =================================================================================
 # OPTIMIZED MODEL WRAPPER
 # =================================================================================
-
 class DepthAnythingV2Wrapper(torch.nn.Module):
     def __init__(self, model, input_size, bev_width_meters, bev_depth_meters,
                  max_depth, sobel_kernel_size=3, roi_start_ratio=0.5):
         super().__init__()
         self.model = model
+        self._replace_gelu_with_tanh_approximation(self.model)
         self.h, self.w = input_size
         self.max_depth = max_depth
         self.bev_roi_start_ratio = roi_start_ratio
@@ -93,6 +91,20 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
 
         # Setup BEV parameters
         self._setup_bev_parameters(bev_width_meters, bev_depth_meters, sobel_kernel_size)
+
+    def _replace_gelu_with_tanh_approximation(self, module):
+        """
+        Recursively replace all GELU(approximate='none' or None)
+        with GELU(approximate='tanh') in the module tree
+        """
+        for name, child in module.named_children():
+            if isinstance(child, torch.nn.GELU):
+                # Replace with tanh approximation version
+                setattr(module, name, torch.nn.GELU(approximate='tanh'))
+                print(f"Replaced GELU at: {name}")
+            else:
+                # Recursively apply to child modules
+                self._replace_gelu_with_tanh_approximation(child)
 
     def _setup_uv_grid(self):
         """Setup UV projection grid."""
@@ -179,10 +191,10 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
             linear_idx = z_idx * self.bev_w + x_idx
             self.bev_flat_buffer.scatter_add_(0, linear_idx, mask_flat)
 
-            # 9. Reshape
-            bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
+            # 9. Reshape, No need to reshape back for ONNX Runtime C-API.
+            # bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
 
-            return depth.squeeze(), bev_map
+            return depth.squeeze(), self.bev_flat_buffer
 
         return depth.squeeze()
 
@@ -240,7 +252,7 @@ print(f'  Output resolution: {input_h}x{input_w}')
 print(f'  BEV ROI start ratio: {BEV_ROI_START_RATIO} (pixel row {roi_start_pixel}/{input_h})')
 print(f'  BEV range: {BEV_WIDTH_METERS}m (width) × {BEV_DEPTH_METERS}m (depth)')
 print(f'  Depth output: float32 in meters [0-{MAX_DEPTH}]')
-print(f'  BEV output: Binary int8 (0 or 1)')
+print(f'  BEV output: Binary uint8 (0 or 1)')
 
 # ONNX Export
 dummy_image = torch.ones(EXPORT_DEPTH_INPUT_SIZE, dtype=torch.uint8)
@@ -263,10 +275,10 @@ with torch.inference_mode():
     )
 print("✅ ONNX export complete.\n")
 
+
 # =================================================================================
 # 2. INFERENCE TEST
 # =================================================================================
-
 print("Starting ONNX inference test...")
 try:
     session_opts = ort.SessionOptions()
@@ -319,10 +331,10 @@ if bev_map is not None:
     print(f"BEV output dtype: {bev_map.dtype}, shape: {bev_map.shape}")
     print(f"BEV value range: [{bev_map.min()}, {bev_map.max()}]")
 
+
 # =================================================================================
 # 3. VISUALIZATION
 # =================================================================================
-
 print("\n📊 Generating visualization...")
 
 # Create figure with fixed aspect ratio subplots
@@ -347,7 +359,7 @@ ax2.axis('off')
 if bev_map is not None:
     ax3 = plt.subplot(1, 3, 3)
     # origin='lower' ensures 0m is at the bottom
-    ax3.imshow(bev_map * 255, cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
+    ax3.imshow((bev_map * 255).reshape(EXPORT_DEPTH_INPUT_SIZE[-2], EXPORT_DEPTH_INPUT_SIZE[-1]), cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
     ax3.set_title("BEV Occupancy (Height-based)")
 
     # Add Grid
