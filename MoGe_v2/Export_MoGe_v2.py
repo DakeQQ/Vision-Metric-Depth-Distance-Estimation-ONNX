@@ -133,9 +133,6 @@ class MoGeV2(torch.nn.Module):
         # BEV Setup
         self._setup_bev_parameters()
 
-        self.a = torch.zeros([1, 1, 1, 1276], dtype=torch.float32)
-        self.b = torch.zeros([1, 1, 359, 1], dtype=torch.float32)
-
     def _replace_gelu_with_tanh_approximation(self, module):
         """
         Recursively replace all GELU(approximate='none' or None)
@@ -273,9 +270,7 @@ class MoGeV2(torch.nn.Module):
 
             # Pad back to ROI size using ONNX-friendly 'replicate' or 'constant'
             # We lost 'sobel_padding' pixels on each side during conv2d
-            # gradient_map = torch.nn.functional.pad(gradient_map, (self.sobel_padding, self.sobel_padding, self.sobel_padding, self.sobel_padding), mode='constant', value=0)
-            gradient_map = torch.cat([self.a, gradient_map, self.a], dim=-2)
-            gradient_map = torch.cat([self.b, gradient_map, self.b], dim=-1)
+            gradient_map = torch.nn.functional.pad(gradient_map, (self.sobel_padding, self.sobel_padding, self.sobel_padding, self.sobel_padding), mode='constant', value=0)
 
             # Flatten
             depth_roi_flat = depth_roi.reshape(-1)
