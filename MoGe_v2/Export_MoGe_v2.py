@@ -276,7 +276,7 @@ class MoGeV2(torch.nn.Module):
             self.bev_flat_buffer.scatter_add_(0, linear_idx, mask_flat)
 
             # Output
-            bev_map = torch.clamp(self.bev_flat_buffer, min=0, max=1).view(self.bev_h, self.bev_w)
+            bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
 
             return depth.squeeze(), bev_map
 
@@ -369,7 +369,7 @@ def visualize_results(input_image, depth_map, bev_map):
     ax1.axhline(y=roi_start_pixel, color='r', linestyle='--', linewidth=2)
     # Add text label for the ignored region
     ax1.text(INPUT_IMAGE_SIZE[1] // 2, roi_start_pixel // 2,
-             'BEV IGNORED REGION\n',
+             'IGNORED REGION\n(Sky/Distant)',
              color='red', fontweight='bold', fontsize=12, ha='center', va='center',
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     ax1.set_title(f'Input Image\n({INPUT_IMAGE_SIZE[1]}x{INPUT_IMAGE_SIZE[0]})', fontsize=12, fontweight='bold')
@@ -389,8 +389,8 @@ def visualize_results(input_image, depth_map, bev_map):
     if bev_map is not None:
         ax3 = plt.subplot(1, 3, 3)
         # origin='lower' ensures 0m is at the bottom
-        ax3.imshow(bev_map, cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
-        ax3.set_title("BEV Occupancy")
+        ax3.imshow(bev_map * 255, cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
+        ax3.set_title("BEV Occupancy (Height-based)")
 
         # Add Grid
         ax3.grid(True, which='both', color='green', linestyle='--', linewidth=0.5, alpha=0.5)
