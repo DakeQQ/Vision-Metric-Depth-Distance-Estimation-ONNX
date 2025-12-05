@@ -170,11 +170,11 @@ class MoGeV2(torch.nn.Module):
     def _setup_bev_parameters(self):
         bev_h, bev_w = self.output_image_size
         
-        self.register_buffer('bev_w', torch.tensor(bev_w, dtype=torch.int64))
-        self.register_buffer('bev_h', torch.tensor(bev_h, dtype=torch.int64))
-        self.register_buffer('bev_scale_x', torch.tensor(bev_w / BEV_WIDTH_METERS, dtype=torch.float32))
-        self.register_buffer('bev_offset_x', torch.tensor(bev_w / 2.0, dtype=torch.float32))
-        self.register_buffer('bev_scale_z', torch.tensor(bev_h / BEV_DEPTH_METERS, dtype=torch.float32))
+        self.register_buffer('bev_w', torch.tensor([bev_w], dtype=torch.int32))
+        self.register_buffer('bev_h', torch.tensor([bev_h], dtype=torch.int64))
+        self.register_buffer('bev_scale_x', torch.tensor([bev_w / BEV_WIDTH_METERS], dtype=torch.float32))
+        self.register_buffer('bev_offset_x', torch.tensor([bev_w / 2.0], dtype=torch.float32))
+        self.register_buffer('bev_scale_z', torch.tensor([bev_h / BEV_DEPTH_METERS], dtype=torch.float32))
 
         ratio = max(0.0, min(1.0, self.bev_roi_start_ratio))
         self.h_start = int(bev_h * ratio)
@@ -189,7 +189,7 @@ class MoGeV2(torch.nn.Module):
         # V-coordinate for Height calculation: (1, 1, ROI_H, ROI_W) - Keep spatial dims for element-wise mul
         self.uv_roi_v = self.full_projection_uv[:, 1:2, self.h_start:self.h_end, self.w_start:self.w_end]
 
-        self.register_buffer('bev_flat_buffer', torch.zeros(bev_h * bev_w, dtype=torch.int8))
+        self.register_buffer('bev_flat_buffer', torch.zeros(bev_h * bev_w, dtype=torch.uint8))
 
     def recover_focal_shift(self, points, focal=None, downsample_size=(64, 64)):
         points_lr = torch.nn.functional.interpolate(
@@ -265,19 +265,18 @@ class MoGeV2(torch.nn.Module):
             grad_roi_flat = gradient_map.reshape(-1)
 
             # Create Mask based on Height Gradient
-            mask_flat = (grad_roi_flat > threshold).to(torch.int8)
+            mask_flat = (grad_roi_flat > threshold).to(torch.uint8)
 
             # BEV Projection (Using U coordinate and Depth)
-            x_idx = (self.uv_roi_u_flat * depth_roi_flat * self.bev_scale_x + self.bev_offset_x).long()
-            z_idx = (depth_roi_flat * self.bev_scale_z).long()
+            x_idx = (self.uv_roi_u_flat * depth_roi_flat * self.bev_scale_x + self.bev_offset_x).int()
+            z_idx = (depth_roi_flat * self.bev_scale_z).int()
 
             # Scatter
             linear_idx = z_idx * self.bev_w + x_idx
             self.bev_flat_buffer.scatter_add_(0, linear_idx, mask_flat)
 
             # Output
-            bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
-            bev_map = torch.clamp(bev_map, min=0, max=1)
+            bev_map = torch.clamp(self.bev_flat_buffer, min=0, max=1).view(self.bev_h, self.bev_w)
 
             return depth.squeeze(), bev_map
 
@@ -370,7 +369,7 @@ def visualize_results(input_image, depth_map, bev_map):
     ax1.axhline(y=roi_start_pixel, color='r', linestyle='--', linewidth=2)
     # Add text label for the ignored region
     ax1.text(INPUT_IMAGE_SIZE[1] // 2, roi_start_pixel // 2,
-             'IGNORED REGION\n(Sky/Distant)',
+             'BEV IGNORED REGION\n',
              color='red', fontweight='bold', fontsize=12, ha='center', va='center',
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     ax1.set_title(f'Input Image\n({INPUT_IMAGE_SIZE[1]}x{INPUT_IMAGE_SIZE[0]})', fontsize=12, fontweight='bold')
@@ -391,7 +390,7 @@ def visualize_results(input_image, depth_map, bev_map):
         ax3 = plt.subplot(1, 3, 3)
         # origin='lower' ensures 0m is at the bottom
         ax3.imshow(bev_map, cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
-        ax3.set_title("BEV Occupancy (Height-based)")
+        ax3.set_title("BEV Occupancy")
 
         # Add Grid
         ax3.grid(True, which='both', color='green', linestyle='--', linewidth=0.5, alpha=0.5)
@@ -423,3 +422,4 @@ if __name__ == "__main__":
 
     # 3. Visualize results
     visualize_results(input_img, depth, bev)
+    
