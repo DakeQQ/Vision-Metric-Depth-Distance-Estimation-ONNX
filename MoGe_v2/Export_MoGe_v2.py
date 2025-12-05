@@ -11,9 +11,9 @@ import matplotlib.pyplot as plt
 # ==============================================================================
 
 
-PROJECT_PATH = '/home/DakeQQ/Downloads/MoGe-main'                   # https://github.com/microsoft/MoGe
-MODEL_PATH = '/home/DakeQQ/Downloads/moge-2-vits-normal/model.pt'   # Only support MoGe_V2
-ONNX_MODEL_PATH = '/home/DakeQQ/Downloads/MoGe_ONNX/MoGe.onnx'
+PROJECT_PATH = '/home/iamj/Downloads/MoGe-main'                   # https://github.com/microsoft/MoGe
+MODEL_PATH = '/home/iamj/Downloads/moge-2-vits-normal/model.pt'   # Only support MoGe_V2
+ONNX_MODEL_PATH = '/home/iamj/Downloads/MoGe_ONNX/MoGe.onnx'
 TEST_IMAGE_PATH = "./test.jpg"
 
 INPUT_IMAGE_SIZE = [720, 1280]   # Input image shape [Height, Width].
@@ -132,6 +132,11 @@ class MoGeV2(torch.nn.Module):
 
         # BEV Setup
         self._setup_bev_parameters()
+
+        self.zeros_h = torch.zeros([1, 1, int(output_image_size[0] * (1 - BEV_ROI_START_RATIO)) - self.sobel_padding, self.sobel_padding], dtype=torch.float32)
+        self.zeros_h_plus_1 = torch.zeros([1, 1, int(output_image_size[0] * (1 - BEV_ROI_START_RATIO)) - self.sobel_padding + 1, self.sobel_padding], dtype=torch.float32)
+        self.zeros_h_minus_1 = torch.zeros([1, 1, int(output_image_size[0] * (1 - BEV_ROI_START_RATIO)) - self.sobel_padding - 1, self.sobel_padding], dtype=torch.float32)
+        self.zeros_w = torch.zeros([1, 1, self.sobel_padding, output_image_size[1] - ((sobel_kernel_size - 1) * 2)], dtype=torch.float32)
 
     def _replace_gelu_with_tanh_approximation(self, module):
         """
@@ -253,8 +258,6 @@ class MoGeV2(torch.nn.Module):
             depth = torch.nn.functional.interpolate(depth, self.output_image_size, mode="bilinear", align_corners=False)
 
         if OUTPUT_BEV:
-            # --- FIXED LOGIC STARTS HERE ---
-
             # Extract ROI Depth
             depth_roi = depth[..., self.h_start:self.h_end, self.w_start:self.w_end]
 
@@ -268,9 +271,13 @@ class MoGeV2(torch.nn.Module):
             dy = torch.nn.functional.conv2d(height_map_roi, self.sobel_y, padding=0)
             gradient_map = dx ** 2 + dy ** 2
 
-            # Pad back to ROI size using ONNX-friendly 'replicate' or 'constant'
-            # We lost 'sobel_padding' pixels on each side during conv2d
-            gradient_map = torch.nn.functional.pad(gradient_map, (self.sobel_padding, self.sobel_padding, self.sobel_padding, self.sobel_padding), mode='constant', value=0)
+            gradient_map = torch.cat([self.zeros_w, gradient_map, self.zeros_w], dim=-2)
+            if self.zeros_h_minus_1.shape[-2] == gradient_map.shape[-2]:
+                gradient_map = torch.cat([self.zeros_h_minus_1, gradient_map, self.zeros_h_minus_1], dim=-1)
+            elif self.zeros_h_plus_1.shape[-2] == gradient_map.shape[-2]:
+                gradient_map = torch.cat([self.zeros_h_plus_1, gradient_map, self.zeros_h_plus_1], dim=-1)
+            else:
+                gradient_map = torch.cat([self.zeros_h, gradient_map, self.zeros_h], dim=-1)
 
             # Flatten
             depth_roi_flat = depth_roi.reshape(-1)
@@ -375,7 +382,7 @@ def visualize_results(input_image, depth_map, bev_map):
     ax1.axhline(y=roi_start_pixel, color='r', linestyle='--', linewidth=2)
     # Add text label for the ignored region
     ax1.text(INPUT_IMAGE_SIZE[1] // 2, roi_start_pixel // 2,
-             'IGNORED REGION\n(Sky/Distant)',
+             'BEV IGNORED REGION\n',
              color='red', fontweight='bold', fontsize=12, ha='center', va='center',
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     ax1.set_title(f'Input Image\n({INPUT_IMAGE_SIZE[1]}x{INPUT_IMAGE_SIZE[0]})', fontsize=12, fontweight='bold')
@@ -396,7 +403,7 @@ def visualize_results(input_image, depth_map, bev_map):
         ax3 = plt.subplot(1, 3, 3)
         # origin='lower' ensures 0m is at the bottom
         ax3.imshow((bev_map * 255).reshape(INPUT_IMAGE_SIZE), cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
-        ax3.set_title("BEV Occupancy (Height-based)")
+        ax3.set_title("BEV Occupancy")
 
         # Add Grid
         ax3.grid(True, which='both', color='green', linestyle='--', linewidth=0.5, alpha=0.5)
