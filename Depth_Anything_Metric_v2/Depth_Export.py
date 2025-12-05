@@ -141,6 +141,11 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
 
         # Buffer for BEV map
         self.register_buffer('bev_flat_buffer', torch.zeros(bev_h * bev_w, dtype=torch.uint8))
+        
+        self.zeros_h = torch.zeros([1, 1, int(EXPORT_DEPTH_INPUT_SIZE[-2] * (1 - BEV_ROI_START_RATIO)) - self.sobel_padding, self.sobel_padding], dtype=torch.float32)
+        self.zeros_h_plus_1 = torch.zeros([1, 1, int(EXPORT_DEPTH_INPUT_SIZE[-2] * (1 - BEV_ROI_START_RATIO)) - self.sobel_padding + 1, self.sobel_padding], dtype=torch.float32)
+        self.zeros_h_minus_1 = torch.zeros([1, 1, int(EXPORT_DEPTH_INPUT_SIZE[-2] * (1 - BEV_ROI_START_RATIO)) - self.sobel_padding - 1, self.sobel_padding], dtype=torch.float32)
+        self.zeros_w = torch.zeros([1, 1, self.sobel_padding, EXPORT_DEPTH_INPUT_SIZE[-1] - ((sobel_kernel_size - 1) * 2)], dtype=torch.float32)
 
     def forward(self, image, threshold):
         # Base model inference
@@ -167,14 +172,13 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
             gradient_map = dx ** 2 + dy ** 2
 
             # 4. Pad back to ROI size (Matches Reference.py)
-            # Padding order: (left, right, top, bottom)
-            pad_size = self.sobel_padding
-            gradient_map = torch.nn.functional.pad(
-                gradient_map, 
-                (pad_size, pad_size, pad_size, pad_size), 
-                mode='constant', 
-                value=0
-            )
+            gradient_map = torch.cat([self.zeros_w, gradient_map, self.zeros_w], dim=-2)
+            if self.zeros_h_minus_1.shape[-2] == gradient_map.shape[-2]:
+                gradient_map = torch.cat([self.zeros_h_minus_1, gradient_map, self.zeros_h_minus_1], dim=-1)
+            elif self.zeros_h_plus_1.shape[-2] == gradient_map.shape[-2]:
+                gradient_map = torch.cat([self.zeros_h_plus_1, gradient_map, self.zeros_h_plus_1], dim=-1)
+            else:
+                gradient_map = torch.cat([self.zeros_h, gradient_map, self.zeros_h], dim=-1)
 
             # 5. Flatten
             depth_roi_flat = depth_roi.reshape(-1)
