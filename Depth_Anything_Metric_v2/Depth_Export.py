@@ -179,8 +179,8 @@ class DepthAnythingV2Wrapper(torch.nn.Module):
             linear_idx = z_idx * self.bev_w + x_idx
             self.bev_flat_buffer.scatter_add_(0, linear_idx, mask_flat)
 
-            # 9. Reshape, and Clamp
-            bev_map = torch.clamp(self.bev_flat_buffer, min=0, max=1).view(self.bev_h, self.bev_w)
+            # 9. Reshape
+            bev_map = self.bev_flat_buffer.view(self.bev_h, self.bev_w)
 
             return depth.squeeze(), bev_map
 
@@ -347,7 +347,7 @@ ax2.axis('off')
 if bev_map is not None:
     ax3 = plt.subplot(1, 3, 3)
     # origin='lower' ensures 0m is at the bottom
-    ax3.imshow(bev_map, cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
+    ax3.imshow(bev_map * 255, cmap='Greys', extent=[-BEV_WIDTH_METERS / 2, BEV_WIDTH_METERS / 2, 0, BEV_DEPTH_METERS], origin='lower')
     ax3.set_title("BEV Occupancy (Height-based)")
 
     # Add Grid
